@@ -94,7 +94,10 @@ void AsyncSink<QueueSize, Policy>::worker_loop()
     while (running_ || !queue_.empty()) {
         QueueItem item;
         if (queue_.dequeue(item)) {
-            wrapped_->log(item);
+            try {
+                wrapped_->log(item);
+            } catch (...) {//防止线程崩溃
+            }
         } else {
             std::this_thread::sleep_for(std::chrono::microseconds(100));
         }
