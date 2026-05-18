@@ -7,15 +7,6 @@
 
 namespace cpp109 {
 
-// ──────────────────────────────────────────────────────────
-// 模块四·ConsoleSink：控制台输出
-//
-// 功能：
-//   - 输出到 stdout（默认）或 stderr
-//   - 根据日志级别着色（可开关）
-//   - 线程安全（基类 mutex 保证输出不交错）
-// ──────────────────────────────────────────────────────────
-
 class ConsoleSink : public Sink {
 public:
     // use_stderr: true 则输出到 stderr，否则 stdout

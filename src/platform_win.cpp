@@ -1,13 +1,4 @@
-﻿// ==========================================================================
-// platform_win.cpp — Windows 平台实现
-//
-// TODO: 实现以下函数
-//   - platform::current_thread_id()   → GetCurrentThreadId()
-//   - platform::set_console_color()   → SetConsoleTextAttribute()
-//   - platform::reset_console_color() → 恢复默认颜色
-// ==========================================================================
-
-#include "../include/log/platform.hpp"
+﻿#include "../include/log/platform.hpp"
 
 #ifdef CPP109_PLATFORM_WINDOWS
 

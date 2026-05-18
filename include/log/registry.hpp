@@ -10,13 +10,6 @@
 
 namespace cpp109 {
 
-// ──────────────────────────────────────────────────────────
-// 模块六：Registry（Logger 管理器）
-//
-// 全局单例，管理所有 Logger 实例。
-// 对标 Python logging.getLogger(__name__) 的底层 Manager。
-// ──────────────────────────────────────────────────────────
-
 class Registry {
 public:
     static Registry& instance() {
@@ -116,11 +109,6 @@ private:
     std::vector<std::shared_ptr<Sink>> default_sinks_;
 };
 
-// ──────────────────────────────────────────────────────────
-// 使用：
-//   auto logger = cpp109::get_logger("mymodule");
-//   logger->info("hello {}", 42);
-// ──────────────────────────────────────────────────────────
 inline std::shared_ptr<Logger> get_logger(const std::string& name) {
     return Registry::instance().get_or_create(name);
 }

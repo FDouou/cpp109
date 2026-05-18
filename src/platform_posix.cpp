@@ -1,13 +1,4 @@
-﻿// ==========================================================================
-// platform_posix.cpp — Linux / macOS 平台实现
-//
-// TODO: 实现以下函数
-//   - platform::current_thread_id()   → pthread_self() 或 gettid()
-//   - platform::set_console_color()   → ANSI Escape Codes
-//   - platform::reset_console_color() → ANSI Reset
-// ==========================================================================
-
-#include "../include/log/platform.hpp"
+﻿#include "../include/log/platform.hpp"
 
 #if defined(CPP109_PLATFORM_LINUX) || defined(CPP109_PLATFORM_MACOS)
 

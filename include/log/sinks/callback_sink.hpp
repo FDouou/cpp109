@@ -6,14 +6,6 @@
 
 namespace cpp109 {
 
-// ──────────────────────────────────────────────────────────
-// 模块四·CallbackSink：自定义回调输出
-//
-// 功能：
-//   - 用户提供回调函数，每条日志都会触发
-//   - 适用场景：发送到网络、写入数据库、第三方监控集成
-// ──────────────────────────────────────────────────────────
-
 class CallbackSink : public Sink {
 public:
     using Callback = std::function<void(const std::string&, const LogEvent& event)>;

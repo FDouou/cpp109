@@ -21,21 +21,6 @@ namespace cpp109 {
 class Logger;
 class Sink;
 
-// ──────────────────────────────────────────────────────────
-// 模块九：Config（C++ 程序化配置 API）
-//
-//
-// 用法示例：
-//   Config cfg;
-//   cfg.add_sink("console")
-//      .set_class<ConsoleSink>()
-//      .set_level(LogLevel::DEBUG);
-//   cfg.add_logger("admin")
-//      .set_sinks({"file", "console"})
-//      .set_level(LogLevel::DEBUG);
-//   cfg.apply();   // 应用到全局 Registry
-// ──────────────────────────────────────────────────────────
-
 class Config {
 public:
     // ── Sink 定义 ────────────────────────────────────

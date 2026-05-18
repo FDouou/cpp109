@@ -29,23 +29,12 @@ endif()
 # 日志级别编译期开关（可选），低于该级别的宏调用在编译期优化掉
 # add_compile_definitions(LOG109CPP_ACTIVE_LEVEL=2)  # 0=TRACE, 1=DEBUG, 2=INFO ...
 
-# ── 库目标（header-only 为主）───────────────────────────────────────
+# ── 库目标（header-only）──────────────────────────────────────────
 add_library(109cpp INTERFACE)
 
 target_include_directories(109cpp INTERFACE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
-
-# 平台源文件
-if(WIN32)
-    target_sources(109cpp INTERFACE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/platform_win.cpp
-    )
-else()
-    target_sources(109cpp INTERFACE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/platform_posix.cpp
-    )
-endif()
 
 # ── 示例程序 ────────────────────────────────────────────────────────
 add_executable(example_basic examples/basic.cpp)
@@ -89,3 +78,7 @@ add_test(NAME test_logger COMMAND test_logger)
 add_executable(test_sinks tests/test_sinks.cpp)
 target_link_libraries(test_sinks 109cpp)
 add_test(NAME test_sinks COMMAND test_sinks)
+
+add_executable(test_macros tests/test_macros.cpp)
+target_link_libraries(test_macros 109cpp)
+add_test(NAME test_macros COMMAND test_macros)

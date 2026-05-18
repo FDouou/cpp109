@@ -11,7 +11,7 @@
 #include "ring_buffer.hpp"
 #include "async_sink.hpp"
 #include "config.hpp"
-#include "config_loader.hpp"
+//#include "config_loader.hpp"
 
 #include "sinks/console_sink.hpp"
 #include "sinks/file_sink.hpp"
