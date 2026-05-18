@@ -19,6 +19,11 @@ CMakeFiles/
 # 测试产生的日志文件
 *.log
 
+# Benchmark 结果（机器相关，不上传）
+bench/benchmark.txt
+compare/bench_compare.txt
+compare/bench_fair.txt
+
 # IDE
 .vscode/
 .vs/

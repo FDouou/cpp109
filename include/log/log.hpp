@@ -18,6 +18,7 @@
 #include "sinks/rotating_file_sink.hpp"
 #include "sinks/daily_file_sink.hpp"
 #include "sinks/callback_sink.hpp"
+#include "sinks/null_sink.hpp"
 
 #define CPP109_DEFAULT_LOGGER() \
     cpp109::Registry::instance().default_logger()
