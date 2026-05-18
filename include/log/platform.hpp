@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include <cstdint>
 
@@ -26,9 +26,6 @@ namespace cpp109 {
 namespace platform {
 
 // ── 线程 ID ─────────────────────────────────────────
-// Windows: GetCurrentThreadId()
-// Linux:   gettid() 或 pthread_self()
-// macOS:   pthread_threadid_np()
 std::uint64_t current_thread_id() noexcept;
 
 // ── 控制台颜色 ──────────────────────────────────────

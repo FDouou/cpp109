@@ -1,10 +1,10 @@
 # 109cpp
-
-C++20 日志库，基于 `std::format` 和 `std::source_location`。
+(未完成)
+C++20 header-only日志库
 
 ## 编译要求
 
-- C++20 编译器（支持 `<format>` 和 `<source_location>`）
+- C++20 编译器
 - CMake 3.20+
 
 ## 快速开始
@@ -12,8 +12,8 @@ C++20 日志库，基于 `std::format` 和 `std::source_location`。
 ### CMake 集成
 
 ```cmake
-add_subdirectory(path/to/109cpp)
-target_link_libraries(your_target 109cpp)
+add_subdirectory(path/to/cpp109)
+target_link_libraries(your_target cpp109)
 ```
 
 ### 基础用法
@@ -29,9 +29,6 @@ int main() {
     logger->warn("something might be wrong, code={}", 500);
     logger->error("something went wrong");
 
-    // 或使用宏
-    LOG_INFO("user {} logged in", "alice");
-    LOG_ERROR("failed to connect to {}", host);
 }
 ```
 
@@ -70,20 +67,6 @@ auto callback = std::make_shared<cpp109::CallbackSink>(
 logger->add_sink(console);
 logger->add_sink(file);
 ```
-
-## 日志宏
-
-| 宏 | 说明 |
-|----|------|
-| `LOG_TRACE(fmt, ...)` | TRACE 级别日志 |
-| `LOG_DEBUG(fmt, ...)` | DEBUG 级别日志 |
-| `LOG_INFO(fmt, ...)` | INFO 级别日志 |
-| `LOG_WARN(fmt, ...)` | WARN 级别日志 |
-| `LOG_ERROR(fmt, ...)` | ERROR 级别日志 |
-| `LOG_FATAL(fmt, ...)` | FATAL 级别日志（日志后终止程序） |
-| `LOG_INFO_IF(cond, fmt, ...)` | 条件日志 |
-| `LOG_INFO_EVERY_N(n, fmt, ...)` | 每 N 次输出一次 |
-| `LOG_INFO_FIRST_N(n, fmt, ...)` | 仅输出前 N 次 |
 
 ## 构建
 
