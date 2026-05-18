@@ -1,0 +1,72 @@
+// ==========================================================================
+// log_config.json — 默认配置文件模板
+//
+// 对标 Django LOGGING 字典结构。
+// 用法：
+//   1. 复制此文件到项目根目录，按需修改
+//   2. 在 main() 开头调用 ConfigLoader::load_from_file("log_config.json")
+// ==========================================================================
+
+{
+    "version": 1,
+    "disable_existing_loggers": false,
+
+    "formatters": {
+        "verbose": {
+            "pattern": "[%Y-%m-%d %H:%M:%S.%f] [%L] [%t] [%g:%#] %v"
+        },
+        "simple": {
+            "pattern": "[%H:%M:%S] [%l] %v"
+        }
+    },
+
+    "sinks": {
+        "console": {
+            "class": "ConsoleSink",
+            "level": "INFO",
+            "colored": true,
+            "formatter": "simple"
+        },
+        "file": {
+            "class": "RotatingFileSink",
+            "level": "INFO",
+            "filename": "logs/app.log",
+            "max_size_mb": 10,
+            "max_files": 5,
+            "formatter": "verbose",
+            "encoding": "utf-8"
+        },
+        "error_file": {
+            "class": "RotatingFileSink",
+            "level": "ERROR",
+            "filename": "logs/error.log",
+            "max_size_mb": 10,
+            "max_files": 5,
+            "formatter": "verbose",
+            "encoding": "utf-8"
+        }
+    },
+
+    "loggers": {
+        "admin": {
+            "level": "DEBUG",
+            "sinks": ["file", "console"],
+            "propagate": false
+        },
+        "goods": {
+            "level": "DEBUG",
+            "sinks": ["file", "console"],
+            "propagate": false
+        },
+        "msg": {
+            "level": "DEBUG",
+            "sinks": ["file", "console"],
+            "propagate": false
+        }
+    },
+
+    "root": {
+        "level": "INFO",
+        "sinks": ["file", "console"]
+    }
+}

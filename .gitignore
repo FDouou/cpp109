@@ -1,0 +1,42 @@
+# 文档
+TODO.md
+DESIGN.md
+
+# 构建产物
+build/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+*.exe
+*.o
+*.obj
+*.a
+*.lib
+*.dll
+*.so
+*.dylib
+
+# 测试产生的日志文件
+*.log
+
+# IDE
+.vscode/
+.vs/
+*.suo
+*.user
+*.swp
+*.swo
+*~
+
+# 编译器产物
+*.pch
+*.idb
+*.ilk
+*.pdb
+*.tlog
+*.lastbuildstate
+
+# 临时文件
+*.tmp
+*.bak
+*.cache
