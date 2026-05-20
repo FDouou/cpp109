@@ -84,8 +84,5 @@ target_link_libraries(test_macros 109cpp)
 add_test(NAME test_macros COMMAND test_macros)
 
 # ── 性能基准（手动运行，不加入 ctest）────────────────────────────
-add_executable(bench_throughput bench/bench_throughput.cpp)
-target_link_libraries(bench_throughput 109cpp)
-
-add_executable(bench_self bench/bench_self.cpp)
-target_link_libraries(bench_self 109cpp)
+add_executable(bench bench/bench.cpp)
+target_link_libraries(bench 109cpp)

@@ -21,8 +21,8 @@ CMakeFiles/
 
 # Benchmark 结果（机器相关，不上传）
 bench/benchmark.txt
-compare/bench_compare.txt
-compare/bench_fair.txt
+bench/bench_self.txt
+bench/bench.txt
 
 # IDE
 .vscode/
