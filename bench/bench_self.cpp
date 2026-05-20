@@ -179,6 +179,8 @@ void print_mt_result(const BenchResult& r)
 
 BenchResult bench_sync(const char* label, bool with_work)
 {
+    size_t rss_before = current_rss_mb();
+
     const char* path = "__bs_sync.log";
     std::remove(path);
 
@@ -205,7 +207,7 @@ BenchResult bench_sync(const char* label, bool with_work)
 
     std::vector<double> lat;
     double cpu_before = process_cpu_sec();
-    size_t rss = current_rss_mb();
+    size_t rss_peak = current_rss_mb();
 
     auto measure_end = std::chrono::steady_clock::now() + std::chrono::seconds(MEASURE_SEC);
 
@@ -226,13 +228,16 @@ BenchResult bench_sync(const char* label, bool with_work)
     logger->clear_sinks();
     std::remove(path);
 
-    return {label, 1, count, actual, elapsed, cpu_elapsed, rss, compute_latency(lat)};
+    size_t rss_delta = (rss_peak > rss_before) ? (rss_peak - rss_before) : 0;
+    return {label, 1, count, actual, elapsed, cpu_elapsed, rss_delta, compute_latency(lat)};
 }
 
 // ── 单线程 — async ──────────────────────────────────────
 
 BenchResult bench_async(const char* label, bool with_work)
 {
+    size_t rss_before = current_rss_mb();
+
     const char* path = "__bs_async.log";
     std::remove(path);
 
@@ -258,7 +263,7 @@ BenchResult bench_async(const char* label, bool with_work)
 
     std::vector<double> lat;
     double cpu_before = process_cpu_sec();
-    size_t rss = current_rss_mb();
+    size_t rss_peak = current_rss_mb();
 
     auto measure_end = std::chrono::steady_clock::now() + std::chrono::seconds(MEASURE_SEC);
 
@@ -279,13 +284,16 @@ BenchResult bench_async(const char* label, bool with_work)
     logger->clear_sinks();
     std::remove(path);
 
-    return {label, 1, count, actual, elapsed, cpu_elapsed, rss, compute_latency(lat)};
+    size_t rss_delta = (rss_peak > rss_before) ? (rss_peak - rss_before) : 0;
+    return {label, 1, count, actual, elapsed, cpu_elapsed, rss_delta, compute_latency(lat)};
 }
 
 // ── 多线程 — 每线程独立 async sink + 独立文件 ───────────
 
 BenchResult bench_multi(int n, bool with_work)
 {
+    size_t rss_before = current_rss_mb();
+
     std::vector<std::string> paths;
     std::vector<std::shared_ptr<cpp109::Logger>> loggers;
 
@@ -331,7 +339,7 @@ BenchResult bench_multi(int n, bool with_work)
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     double cpu_before = process_cpu_sec();
-    size_t rss = current_rss_mb();
+    size_t rss_peak = current_rss_mb();
 
     std::this_thread::sleep_for(std::chrono::seconds(MEASURE_SEC));
     double cpu_elapsed = process_cpu_sec() - cpu_before;
@@ -346,9 +354,12 @@ BenchResult bench_multi(int n, bool with_work)
         std::remove(p.c_str());
     }
 
+    loggers.clear();
+
+    size_t rss_delta = (rss_peak > rss_before) ? (rss_peak - rss_before) : 0;
     std::string tag = std::to_string(n) + "t async" + (with_work ? " + work" : "");
     return {"cpp109 " + tag, n, total.load(), actual,
-            (double)MEASURE_SEC, cpu_elapsed, rss, {0, 0, 0}};
+            (double)MEASURE_SEC, cpu_elapsed, rss_delta, {0, 0, 0}};
 }
 
 } // anonymous namespace
@@ -363,19 +374,27 @@ int main()
     print_header("1. Single-thread throughput (sync / async / async+work)");
 
     print_result(bench_sync("sync, no work", false));
+    cpp109::Registry::instance().remove_all();
     print_result(bench_sync("sync + work", true));
+    cpp109::Registry::instance().remove_all();
     print_result(bench_async("async, no work", false));
+    cpp109::Registry::instance().remove_all();
     print_result(bench_async("async + work", true));
+    cpp109::Registry::instance().remove_all();
 
     // ── Section 2: 多线程，无工作负载 ─────────────────────
     print_mt_header("2. Multi-thread async (no work, per-thread async sink)");
-    for (int n : {4, 8, 16, 32, 64})
+    for (int n : {4, 8, 16, 32, 64}) {
         print_mt_result(bench_multi(n, false));
+        cpp109::Registry::instance().remove_all();
+    }
 
     // ── Section 3: 多线程，模拟工作负载 ───────────────────
     print_mt_header("3. Multi-thread async + 10us work (per-thread async sink)");
-    for (int n : {4, 8, 16, 32, 64})
+    for (int n : {4, 8, 16, 32, 64}) {
         print_mt_result(bench_multi(n, true));
+        cpp109::Registry::instance().remove_all();
+    }
 
     printf("\n");
     return 0;
