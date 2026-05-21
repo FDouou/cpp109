@@ -30,9 +30,9 @@ public:
         if(event.level() < level_){
             return;
         }
-        std::string formatted_msg;
-        formatter_->format(event, formatted_msg);
-        write(formatted_msg, event);
+        static thread_local std::string tl_buf;
+        formatter_->format(event, tl_buf);
+        write(tl_buf, event);
     }
     void flush(){
         std::lock_guard<std::mutex> lock(mutex_);
@@ -58,9 +58,9 @@ public:
 protected:
     void log_unlock(const LogEvent& event) {
         if (event.level() < level_) return;
-        std::string formatted_msg;
-        formatter_->format(event, formatted_msg);
-        write(formatted_msg, event);
+        static thread_local std::string tl_buf;
+        formatter_->format(event, tl_buf);
+        write(tl_buf, event);
     }
 
     virtual void write(const std::string& formatted_msg, const LogEvent& event) = 0;

@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "../sink.hpp"
 
@@ -38,7 +38,7 @@ public:
 protected:
     void write(const std::string& formatted_msg, const LogEvent& event) override{
         fwrite(formatted_msg.data(), 1, formatted_msg.size(), file_);
-        fwrite("\n", 1, 1, file_);
+        fputc('\n', file_);
         if(flush_interval_ms_ == 0) {
             flush_impl();
         }else if(flush_interval_ms_ > 0) {

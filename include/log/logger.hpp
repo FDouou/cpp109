@@ -84,7 +84,8 @@ private:
     void log_impl(LogLevel level, std::string message, std::source_location loc){
         if(level < this->level()) return;
 
-        LogEvent event = {name_, level, std::move(message), Timestamp(), loc, platform::current_thread_id()};
+        static thread_local std::uint64_t tl_tid = platform::current_thread_id();
+        LogEvent event = {name_, level, std::move(message), Timestamp(), loc, tl_tid};
 
         auto fast = fast_sink_.load(std::memory_order_acquire);
         if (fast && parent_.expired()) {

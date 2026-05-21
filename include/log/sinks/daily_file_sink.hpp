@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "../sink.hpp"
 #include "../timestamp.hpp"
@@ -44,7 +44,7 @@ protected:
             do_rotate();
         }
         fwrite(formatted_msg.data(), 1, formatted_msg.size(), file_);
-        fwrite("\n", 1, 1, file_);
+        fputc('\n', file_);
     }
 
     void flush_impl() override {
