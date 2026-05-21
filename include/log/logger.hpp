@@ -55,7 +55,7 @@ public:
     void clear_sinks(){
         std::lock_guard<std::mutex> lock(mutex_);
         sinks_.clear();
-        fast_sink_.store(nullptr, std::memory_order_release);
+        std::atomic_store_explicit(&fast_sink_, std::shared_ptr<Sink>{nullptr}, std::memory_order_release);
     }
 
     void set_level(LogLevel level) { level_.store(level, std::memory_order_release); }
@@ -87,7 +87,7 @@ private:
         static thread_local std::uint64_t tl_tid = platform::current_thread_id();
         LogEvent event = {name_, level, std::move(message), Timestamp(), loc, tl_tid};
 
-        auto fast = fast_sink_.load(std::memory_order_acquire);
+        auto fast = std::atomic_load_explicit(&fast_sink_, std::memory_order_acquire);
         if (fast && parent_.expired()) {
             if (level == LogLevel::FATAL) {
                 fast->log(event);
@@ -129,9 +129,9 @@ private:
 
     void update_fast_path_unlocked(){
         if (sinks_.size() == 1)
-            fast_sink_.store(sinks_[0], std::memory_order_release);
+            std::atomic_store_explicit(&fast_sink_, sinks_[0], std::memory_order_release);
         else
-            fast_sink_.store(nullptr, std::memory_order_release);
+            std::atomic_store_explicit(&fast_sink_, std::shared_ptr<Sink>{nullptr}, std::memory_order_release);
     }
 
     std::string       name_;
@@ -139,7 +139,7 @@ private:
     std::atomic<bool> propagate_ = true;
     std::weak_ptr<Logger> parent_;
     std::vector<std::shared_ptr<Sink>> sinks_;
-    std::atomic<std::shared_ptr<Sink>> fast_sink_;
+    std::shared_ptr<Sink> fast_sink_;
     std::mutex        mutex_;
 };
 
