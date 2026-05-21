@@ -21,6 +21,7 @@ public:
     ~RingBuffer() = default;
 
     bool enqueue(const T& item);
+    bool enqueue(T&& item);
     bool dequeue(T& item);
 
     bool empty() const noexcept;
@@ -41,13 +42,13 @@ bool RingBuffer<T, Size, Policy>::enqueue(const T& item)
 {
     auto wp = write_pos_.load(std::memory_order_relaxed);
     auto rp = read_pos_.load(std::memory_order_acquire);
-    
+
     if (wp - rp < Size) {
         buffer_[wp & MASK] = item;
         write_pos_.store(wp + 1, std::memory_order_release);
         return true;
     }
-    
+
     if constexpr (Policy == OverflowPolicy::DROP_NEWEST) {
         return false;
     }
@@ -65,6 +66,34 @@ bool RingBuffer<T, Size, Policy>::enqueue(const T& item)
 }
 
 template<typename T, std::size_t Size, OverflowPolicy Policy>
+bool RingBuffer<T, Size, Policy>::enqueue(T&& item)
+{
+    auto wp = write_pos_.load(std::memory_order_relaxed);
+    auto rp = read_pos_.load(std::memory_order_acquire);
+
+    if (wp - rp < Size) {
+        buffer_[wp & MASK] = std::move(item);
+        write_pos_.store(wp + 1, std::memory_order_release);
+        return true;
+    }
+
+    if constexpr (Policy == OverflowPolicy::DROP_NEWEST) {
+        return false;
+    }
+    else if constexpr (Policy == OverflowPolicy::BLOCK) {
+        while (true) {
+            std::this_thread::yield();
+            rp = read_pos_.load(std::memory_order_acquire);
+            if (wp - rp < Size) {
+                buffer_[wp & MASK] = std::move(item);
+                write_pos_.store(wp + 1, std::memory_order_release);
+                return true;
+            }
+        }
+    }
+}
+
+template<typename T, std::size_t Size, OverflowPolicy Policy>
 bool RingBuffer<T, Size, Policy>::dequeue(T& item)
 {
     auto rp = read_pos_.load(std::memory_order_relaxed);
@@ -73,7 +102,7 @@ bool RingBuffer<T, Size, Policy>::dequeue(T& item)
     if (rp == wp) {
         return false;
     }
-    item = buffer_[rp & MASK];
+    item = std::move(buffer_[rp & MASK]);
     read_pos_.store(rp + 1, std::memory_order_release);
     return true;
 }

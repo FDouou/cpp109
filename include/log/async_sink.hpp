@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "sink.hpp"
 #include "log_event.hpp"
@@ -74,7 +74,8 @@ template<std::size_t QueueSize, OverflowPolicy Policy>
 void AsyncSink<QueueSize, Policy>::log(const LogEvent& event)
 {
     if (event.level() < this->level()) return;
-    queue_.enqueue(event);
+    auto copy = event;
+    queue_.enqueue(std::move(copy));
 }
 
 template<std::size_t QueueSize, OverflowPolicy Policy>
@@ -95,7 +96,7 @@ void AsyncSink<QueueSize, Policy>::worker_loop()
         QueueItem item;
         if (queue_.dequeue(item)) {
             try {
-                wrapped_->log(item);
+                wrapped_->log_unlock(item);
             } catch (...) {//防止线程崩溃
             }
         } else {

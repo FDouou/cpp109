@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "log_event.hpp"
 #include "formatter.hpp"
@@ -10,7 +10,15 @@
 
 namespace cpp109 {
 
+enum class OverflowPolicy;
+
+template<std::size_t, OverflowPolicy>
+class AsyncSink;
+
 class Sink {
+    template<std::size_t, OverflowPolicy>
+    friend class AsyncSink;
+
 public:
     Sink(){
         formatter_ = std::make_unique<Formatter>();
@@ -48,7 +56,13 @@ public:
         formatter_->set_pattern(pattern);
     }
 protected:
-    // 子类实现：将格式化后的字符串写入目标
+    void log_unlock(const LogEvent& event) {
+        if (event.level() < level_) return;
+        std::string formatted_msg;
+        formatter_->format(event, formatted_msg);
+        write(formatted_msg, event);
+    }
+
     virtual void write(const std::string& formatted_msg, const LogEvent& event) = 0;
     // 子类实现：刷新缓冲区
     virtual void flush_impl(){

@@ -6,7 +6,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
+#include <cstdarg>
 #include <memory>
 #include <string>
 #include <thread>
@@ -134,31 +134,46 @@ struct BenchResult
 
 // ── 输出 ──────────────────────────────────────────────────
 
+static FILE* g_out = nullptr;
+
+void tee_printf(const char* fmt, ...)
+{
+    va_list args1, args2;
+    va_start(args1, fmt);
+    va_copy(args2, args1);
+
+    vprintf(fmt, args1);
+    if (g_out) vfprintf(g_out, fmt, args2);
+
+    va_end(args2);
+    va_end(args1);
+}
+
 void print_header(const char* title)
 {
-    printf("\n================================================================================\n");
-    printf("  %s\n", title);
-    printf("================================================================================\n");
-    printf("%-4s %-34s %10s %10s %6s %7s %10s %10s %10s %10s\n",
+    tee_printf("\n================================================================================\n");
+    tee_printf("  %s\n", title);
+    tee_printf("================================================================================\n");
+    tee_printf("%-4s %-34s %10s %10s %6s %7s %10s %10s %10s %10s\n",
            "Th", "Scenario", "Produced", "Consumed", "Loss%",
            "RSS_MB", "msg/s", "P50us", "P90us", "P99us");
-    printf("%s\n", std::string(117, '-').c_str());
+    tee_printf("%s\n", std::string(117, '-').c_str());
 }
 
 void print_mt_header(const char* title)
 {
-    printf("\n================================================================================\n");
-    printf("  %s\n", title);
-    printf("================================================================================\n");
-    printf("%-4s %-34s %10s %10s %6s %7s %10s %10s\n",
+    tee_printf("\n================================================================================\n");
+    tee_printf("  %s\n", title);
+    tee_printf("================================================================================\n");
+    tee_printf("%-4s %-34s %10s %10s %6s %7s %10s %10s\n",
            "Th", "Scenario", "Produced", "Consumed", "Loss%",
            "RSS_MB", "msg/s", "total msg/s");
-    printf("%s\n", std::string(97, '-').c_str());
+    tee_printf("%s\n", std::string(97, '-').c_str());
 }
 
 void print_result(const BenchResult& r)
 {
-    printf("%-4d %-34s %10llu %10llu %5.1f %6zu %10llu %10.0f %10.0f %10.0f\n",
+    tee_printf("%-4d %-34s %10llu %10llu %5.1f %6zu %10llu %10.0f %10.0f %10.0f\n",
            r.threads, r.name.c_str(),
            (unsigned long long)r.produced, (unsigned long long)r.consumed,
            r.loss_pct(), r.rss_mb, (unsigned long long)r.rate(),
@@ -168,7 +183,7 @@ void print_result(const BenchResult& r)
 void print_mt_result(const BenchResult& r)
 {
     double per_thread = r.rate() / (double)r.threads;
-    printf("%-4d %-34s %10llu %10llu %5.1f %6zu %10llu %10.0f\n",
+    tee_printf("%-4d %-34s %10llu %10llu %5.1f %6zu %10llu %10.0f\n",
            r.threads, r.name.c_str(),
            (unsigned long long)r.produced, (unsigned long long)r.consumed,
            r.loss_pct(), r.rss_mb, (unsigned long long)r.rate(),
@@ -366,8 +381,11 @@ BenchResult bench_multi(int n, bool with_work)
 
 int main()
 {
-    printf("=== cpp109 self-benchmark ===\n");
-    printf("Warmup: %ds   Measure: %ds   Simulated work: %dus\n\n",
+    g_out = fopen("bench/bench.txt", "w");
+    if (!g_out) g_out = fopen("../bench/bench.txt", "w");
+
+    tee_printf("=== cpp109 self-benchmark ===\n");
+    tee_printf("Warmup: %ds   Measure: %ds   Simulated work: %dus\n\n",
            WARMUP_SEC, MEASURE_SEC, WORK_US);
 
     // ── Section 1: 单线程基线 ────────────────────────────
@@ -396,6 +414,8 @@ int main()
         cpp109::Registry::instance().remove_all();
     }
 
-    printf("\n");
+    tee_printf("\n");
+
+    if (g_out) fclose(g_out);
     return 0;
 }
