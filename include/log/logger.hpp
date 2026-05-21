@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "log_level.hpp"
 #include "log_event.hpp"
@@ -37,7 +37,6 @@ public:
     template<typename... Args>
     void fatal(std::format_string<Args...> fmt, Args&&... args);
 
-    // 低级入口：直接传已格式化字符串    跳过 std::format 步骤
     void log(LogLevel level, std::string formatted_msg,
              std::source_location loc){
                 log_impl(level, std::move(formatted_msg), loc);
@@ -46,14 +45,17 @@ public:
     void add_sink(std::shared_ptr<Sink> sink){
         std::lock_guard<std::mutex> lock(mutex_);
         sinks_.push_back(sink);
+        update_fast_path_unlocked();
     }
     void remove_sink(std::shared_ptr<Sink> sink){
         std::lock_guard<std::mutex> lock(mutex_);
         sinks_.erase(std::remove(sinks_.begin(), sinks_.end(), sink), sinks_.end());
+        update_fast_path_unlocked();
     }
     void clear_sinks(){
         std::lock_guard<std::mutex> lock(mutex_);
         sinks_.clear();
+        fast_sink_.store(nullptr, std::memory_order_release);
     }
 
     void set_level(LogLevel level) { level_.store(level, std::memory_order_release); }
@@ -62,10 +64,9 @@ public:
     const std::string& name() const noexcept { return name_; }
     void set_name(const std::string& name) { name_ = name; }
 
-    void set_parent(const std::shared_ptr<Logger>& parent) { 
+    void set_parent(const std::shared_ptr<Logger>& parent) {
         std::lock_guard<std::mutex> lock(mutex_);
-        //隐式转换 降级为weak_ptr防止logger循环引用
-        parent_ = parent; 
+        parent_ = parent;
     }
     std::shared_ptr<Logger> parent() const noexcept { return parent_.lock(); }
 
@@ -80,11 +81,22 @@ public:
     bool propagate() const noexcept { return propagate_.load(std::memory_order_acquire); }
 
 private:
-    // 内部日志分发
     void log_impl(LogLevel level, std::string message, std::source_location loc){
         if(level < this->level()) return;
 
         LogEvent event = {name_, level, std::move(message), Timestamp(), loc, platform::current_thread_id()};
+
+        auto fast = fast_sink_.load(std::memory_order_acquire);
+        if (fast && parent_.expired()) {
+            if (level == LogLevel::FATAL) {
+                fast->log(event);
+                fast->flush();
+                std::abort();
+            }
+            fast->log(event);
+            return;
+        }
+
         std::shared_ptr<Logger> parent;
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -114,11 +126,19 @@ private:
         }
     }
 
+    void update_fast_path_unlocked(){
+        if (sinks_.size() == 1)
+            fast_sink_.store(sinks_[0], std::memory_order_release);
+        else
+            fast_sink_.store(nullptr, std::memory_order_release);
+    }
+
     std::string       name_;
     std::atomic<LogLevel> level_ = LogLevel::INFO;
     std::atomic<bool> propagate_ = true;
     std::weak_ptr<Logger> parent_;
     std::vector<std::shared_ptr<Sink>> sinks_;
+    std::atomic<std::shared_ptr<Sink>> fast_sink_;
     std::mutex        mutex_;
 };
 

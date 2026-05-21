@@ -381,8 +381,8 @@ BenchResult bench_multi(int n, bool with_work)
 
 int main()
 {
-    g_out = fopen("bench/bench.txt", "w");
-    if (!g_out) g_out = fopen("../bench/bench.txt", "w");
+    g_out = fopen("bench/bench.txt", "a");
+    if (!g_out) g_out = fopen("../bench/bench.txt", "a");
 
     tee_printf("=== cpp109 self-benchmark ===\n");
     tee_printf("Warmup: %ds   Measure: %ds   Simulated work: %dus\n\n",

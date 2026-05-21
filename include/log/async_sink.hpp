@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <memory>
 #include <string>
 #include <thread>
@@ -25,7 +26,6 @@ public:
     void stop();
 
 protected:
-    // 不会被调用
     void write(const std::string&, const LogEvent&) override {}
 
 private:
@@ -37,6 +37,8 @@ private:
     RingBuffer<QueueItem, QueueSize, Policy> queue_;
     std::thread             worker_;
     std::atomic<bool>       running_{true};
+    std::condition_variable cv_;
+    std::mutex              cv_mutex_;
 };
 
 template<typename SinkType,
@@ -66,6 +68,7 @@ template<std::size_t QueueSize, OverflowPolicy Policy>
 void AsyncSink<QueueSize, Policy>::stop()
 {
     if (running_.exchange(false)) {
+        cv_.notify_one();
         worker_.join();
     }
 }
@@ -76,6 +79,7 @@ void AsyncSink<QueueSize, Policy>::log(const LogEvent& event)
     if (event.level() < this->level()) return;
     auto copy = event;
     queue_.enqueue(std::move(copy));
+    cv_.notify_one();
 }
 
 template<std::size_t QueueSize, OverflowPolicy Policy>
@@ -97,10 +101,10 @@ void AsyncSink<QueueSize, Policy>::worker_loop()
         if (queue_.dequeue(item)) {
             try {
                 wrapped_->log_unlock(item);
-            } catch (...) {//防止线程崩溃
-            }
+            } catch (...) {}
         } else {
-            std::this_thread::sleep_for(std::chrono::microseconds(100));
+            std::unique_lock<std::mutex> lk(cv_mutex_);
+            cv_.wait_for(lk, std::chrono::microseconds(100));
         }
     }
 
