@@ -377,6 +377,139 @@ BenchResult bench_multi(int n, bool with_work)
             (double)MEASURE_SEC, cpu_elapsed, rss_delta, {0, 0, 0}};
 }
 
+// ── 多线程 — NullSink 异步（排除磁盘 I/O 瓶颈）──────────
+
+BenchResult bench_multi_nullsink(int n, bool with_work)
+{
+    size_t rss_before = current_rss_mb();
+
+    std::vector<std::shared_ptr<cpp109::Logger>> loggers;
+    std::vector<std::shared_ptr<cpp109::Sink>> sinks;
+
+    for (int i = 0; i < n; ++i) {
+        auto null = std::make_shared<cpp109::NullSink>();
+        auto sink = std::make_shared<cpp109::AsyncSink<>>(null);
+        sinks.push_back(sink);
+        auto l = cpp109::get_logger("__bn_" + std::to_string(i));
+        l->clear_sinks();
+        l->set_level(cpp109::LogLevel::TRACE);
+        l->add_sink(sink);
+        loggers.push_back(l);
+    }
+
+    std::atomic<uint64_t> total{0};
+    std::atomic<bool> warmup{true};
+    std::atomic<bool> running{true};
+
+    auto worker = [&](int id) {
+        auto& l = loggers[id];
+        uint64_t local = 0;
+        while (warmup) {
+            l->info("w{} {}", id, local);
+            if (with_work) simulated_work();
+            ++local;
+        }
+        while (running) {
+            l->info("r{} {}", id, local);
+            if (with_work) simulated_work();
+            ++local;
+        }
+        total += local;
+    };
+
+    std::vector<std::thread> threads;
+    for (int i = 0; i < n; ++i)
+        threads.emplace_back(worker, i);
+
+    std::this_thread::sleep_for(std::chrono::seconds(WARMUP_SEC));
+    total.store(0);
+    warmup = false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    double cpu_before = process_cpu_sec();
+    size_t rss_peak = current_rss_mb();
+
+    std::this_thread::sleep_for(std::chrono::seconds(MEASURE_SEC));
+    double cpu_elapsed = process_cpu_sec() - cpu_before;
+    running = false;
+
+    for (auto& t : threads) t.join();
+
+    for (auto& s : sinks) s->flush();
+    sinks.clear();
+    loggers.clear();
+
+    uint64_t produced = total.load();
+    size_t rss_delta = (rss_peak > rss_before) ? (rss_peak - rss_before) : 0;
+    std::string tag = std::to_string(n) + "t async+null" + (with_work ? " + work" : "");
+    return {"cpp109 " + tag, n, produced, produced,
+            (double)MEASURE_SEC, cpu_elapsed, rss_delta, {0, 0, 0}};
+}
+
+// ── 多线程 — NullSink 同步（测量纯 logger 调用开销）─────
+
+BenchResult bench_multi_sync_nullsink(int n, bool with_work)
+{
+    size_t rss_before = current_rss_mb();
+
+    std::vector<std::shared_ptr<cpp109::Logger>> loggers;
+
+    for (int i = 0; i < n; ++i) {
+        auto sink = std::make_shared<cpp109::NullSink>();
+        auto l = cpp109::get_logger("__bsn_" + std::to_string(i));
+        l->clear_sinks();
+        l->set_level(cpp109::LogLevel::TRACE);
+        l->add_sink(sink);
+        loggers.push_back(l);
+    }
+
+    std::atomic<uint64_t> total{0};
+    std::atomic<bool> warmup{true};
+    std::atomic<bool> running{true};
+
+    auto worker = [&](int id) {
+        auto& l = loggers[id];
+        uint64_t local = 0;
+        while (warmup) {
+            l->info("w{} {}", id, local);
+            if (with_work) simulated_work();
+            ++local;
+        }
+        while (running) {
+            l->info("r{} {}", id, local);
+            if (with_work) simulated_work();
+            ++local;
+        }
+        total += local;
+    };
+
+    std::vector<std::thread> threads;
+    for (int i = 0; i < n; ++i)
+        threads.emplace_back(worker, i);
+
+    std::this_thread::sleep_for(std::chrono::seconds(WARMUP_SEC));
+    total.store(0);
+    warmup = false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    double cpu_before = process_cpu_sec();
+    size_t rss_peak = current_rss_mb();
+
+    std::this_thread::sleep_for(std::chrono::seconds(MEASURE_SEC));
+    double cpu_elapsed = process_cpu_sec() - cpu_before;
+    running = false;
+
+    for (auto& t : threads) t.join();
+
+    loggers.clear();
+
+    uint64_t produced = total.load();
+    size_t rss_delta = (rss_peak > rss_before) ? (rss_peak - rss_before) : 0;
+    std::string tag = std::to_string(n) + "t sync+null" + (with_work ? " + work" : "");
+    return {"cpp109 " + tag, n, produced, produced,
+            (double)MEASURE_SEC, cpu_elapsed, rss_delta, {0, 0, 0}};
+}
+
 } // anonymous namespace
 
 int main()
@@ -411,6 +544,34 @@ int main()
     print_mt_header("3. Multi-thread async + 10us work (per-thread async sink)");
     for (int n : {4, 8, 16, 32, 64}) {
         print_mt_result(bench_multi(n, true));
+        cpp109::Registry::instance().remove_all();
+    }
+
+    // ── Section 4: NullSink 异步（排除磁盘 I/O）────────────
+    print_mt_header("4. Multi-thread async+null (no disk, isolate ringbuffer overhead)");
+    for (int n : {4, 8, 16, 32, 64}) {
+        print_mt_result(bench_multi_nullsink(n, false));
+        cpp109::Registry::instance().remove_all();
+    }
+
+    // ── Section 5: NullSink 异步 + 工作负载 ───────────────
+    print_mt_header("5. Multi-thread async+null + 10us work (no disk)");
+    for (int n : {4, 8, 16, 32, 64}) {
+        print_mt_result(bench_multi_nullsink(n, true));
+        cpp109::Registry::instance().remove_all();
+    }
+
+    // ── Section 6: NullSink 同步（纯 logger 开销基线）─────
+    print_mt_header("6. Multi-thread sync+null (raw logger overhead, no ringbuffer)");
+    for (int n : {4, 8, 16, 32, 64}) {
+        print_mt_result(bench_multi_sync_nullsink(n, false));
+        cpp109::Registry::instance().remove_all();
+    }
+
+    // ── Section 7: NullSink 同步 + 工作负载 ───────────────
+    print_mt_header("7. Multi-thread sync+null + 10us work (raw overhead)");
+    for (int n : {4, 8, 16, 32, 64}) {
+        print_mt_result(bench_multi_sync_nullsink(n, true));
         cpp109::Registry::instance().remove_all();
     }
 

@@ -136,10 +136,18 @@ worker_N ───→ RingBuffer_N ───→ bg_thread_N ───→ file_N.
 
 **核心优势**：
 
-- **线性扩展**：每增加一个写入线程，吞吐量线性增长，不会落入单消费者瓶颈
-- **零锁竞争**：SPSC RingBuffer 无需 CAS 重试，入队仅两次原子操作
-- **无头阻塞**：一个 worker 的磁盘写入阻塞，不影响其他 worker
-- **条件变量唤醒**：数据到达立即通知 worker，空闲时零 CPU 占用
+- **无锁入队**：SPSC RingBuffer 无需 CAS 重试，入队仅两次原子操作
+- **无 Head-of-line 阻塞**：一个 worker 的磁盘写入阻塞，不影响其他 worker
+- **低延迟唤醒**：数据到达立即通过条件变量通知 consumer 线程，空闲时零 CPU 占用
+- **格式化分工**：消息体的 `std::format` 在 worker 线程完成，pattern formatting 由 consumer 线程承担，避免串行瓶颈
+
+> **使用建议**：
+> - AsyncSink 的价值在于 worker 不被 I/O 阻塞——入队 ~2µs 即返回，consumer 后台写盘。
+> - FileSink 等 I/O 密集型 Sink 的 consumer 线程大部分时间阻塞在磁盘写入，实际 CPU 占用极低，
+>   线程数可以更宽松（Benchmark 显示 16t async 仍有良好增长）。
+> - ConsoleSink / NullSink 等 CPU 密集型 Sink 的 consumer 持续占用 CPU，总线程数不宜超物理核心。
+> - 不在意 worker 阻塞的场景，sync Sink（内部 `std::lock_guard`）总吞吐更高。
+> - 多线程写同一个文件用 sync Sink，不要用 AsyncSink（SPSC 队列限定单生产者）。
 
 ### 构造方式
 
@@ -155,15 +163,15 @@ auto async_file = std::make_shared<cpp109::AsyncSink<>>(file);
 ### 多线程高并发示例
 
 ```cpp
-// 每个线程绑定独立的 AsyncSink 和文件，达到最大吞吐
-for (int i = 0; i < 16; ++i) {
+// AsyncSink 数量建议参考 CPU 物理核心数
+for (int i = 0; i < 8; ++i) {
     auto sink = cpp109::make_async_sink<cpp109::FileSink>(
         "thread_" + std::to_string(i) + ".log", true);
     auto logger = cpp109::get_logger("worker_" + std::to_string(i));
     logger->add_sink(sink);
 }
 
-// 16 个线程同时高频写日志，各自独立队列和文件，互不阻塞
+// 每个线程绑定独立的 AsyncSink + 文件，互不阻塞
 ```
 
 ## Logger 层级
@@ -259,26 +267,37 @@ ctest --test-dir build
 
 ## 性能
 
-以下数据在 Windows 11 / MinGW GCC 14 / SSD 环境下测得（预热 3s，测量 10s，单条日志 \~100 字节）。
+以下数据在 Windows 11 / MinGW GCC 14 / SSD 环境测得，CPU 为 Intel i9-12900HX（16 个物理核心）。
+预热 3s，测量 10s，单条日志 ~100 字节，格式化占位符使用默认配置。
 
-### 单线程（带 10µs 模拟工作负载）
+### 单线程基线
 
-| 模式    | 吞吐量          | P50 延迟 | P99 延迟 |
-| ----- | ------------ | ------ | ------ |
-| sync  | 79,000 msg/s | 2µs    | 12µs   |
-| async | 81,000 msg/s | 1µs    | 7µs    |
+| 模式               | 吞吐量          | P50 延迟 | P99 延迟 |
+| ----------------- | ------------ | ------ | ------ |
+| sync, no work     | 506,000 msg/s | 2µs    | 7µs    |
+| async, no work    | 351,000 msg/s | 3µs    | 6µs    |
+| sync + 10µs work  | 80,000 msg/s  | 2µs    | 11µs   |
+| async + 10µs work | 82,000 msg/s  | 1µs    | 7µs    |
 
-> 10µs 工作负载下异步与同步持平，实际业务代码中间隔更长，两者体验无差异。
+> 不带 work 时 sync 更快（单线程没有 I/O 可重叠，AsyncSink 的入队和事件复制是纯开销）。
+> 带 10µs 工作负载后两者持平，work 本身成为耗时主体。
 
-### 多线程 async（per-thread 独立 AsyncSink）
+### 多线程吞吐（per-thread 独立 AsyncSink + 独立文件）
 
-| 线程数 | 总吞吐量            | 扩展比   | 说明            |
-| --- | --------------- | ----- | ------------- |
-| 4t  | 803,000 msg/s   | 1.00x | <br />        |
-| 8t  | 1,431,000 msg/s | 1.78x | <br />        |
-| 16t | 2,259,000 msg/s | 2.81x | <br />        |
-| 32t | 2,645,000 msg/s | 3.29x | <br />        |
-| 64t | 2,665,000 msg/s | 3.32x | SSD 磁盘 I/O 瓶颈 |
+| 线程数 | 总吞吐量            | 扩展比 |
+| --- | --------------- | ----- |
+| 4t  | 1,047,000 msg/s | 1.00× |
+| 8t  | 1,424,000 msg/s | 1.36× |
+| 16t | 2,220,000 msg/s | 2.12× |
+| 32t | 2,589,000 msg/s | 2.47× |
+| 64t | 2,708,000 msg/s | 2.59× |
 
-> 32t 之后受物理磁盘写入上限约束
+### 多线程 NullSink（排除磁盘 I/O，仅保留格式化与队列开销）
+
+| 模式 | 4t | 8t | 16t | 32t | 64t |
+|------|----|----|-----|-----|-----|
+| async+null | 3,460,000 | 4,450,000 | 4,885,000  | 5,040,000  | 5,291,000  |
+| sync+null | 2,599,000 | 3,961,000 | 5,051,000  | 5,506,000  | 5,811,000  |
+
+> `t` = worker 线程数。async 行另有等量 consumer 后台线程（如 4t async = 4 worker + 4 consumer = 8 线程），sync 行无额外线程。两行线程总数不同，表格为相同 worker 数下的对照。
 
