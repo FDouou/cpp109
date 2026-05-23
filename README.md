@@ -229,6 +229,21 @@ cfg.add_logger("admin")
 cfg.apply();
 ```
 
+任意 sink 可通过 `set_async()`包装：
+
+```cpp
+cfg.add_sink("file")
+   .set_class<cpp109::RotatingFileSink>()
+   .set_property("filename", "logs/app.log")
+   .set_property("max_size_mb", "10")
+   .set_property("max_files", "5")
+   .set_async()                                   // 默认 queue_size=8192, overflow_policy=block
+   .set_queue_size(8192)                          
+   .set_overflow_policy("block");                 
+```
+
+
+
 ## 构建
 
 ```bash

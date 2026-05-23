@@ -2,6 +2,7 @@
 
 #include "log_level.hpp"
 #include "registry.hpp"
+#include "async_sink.hpp"
 #include "sinks/console_sink.hpp"
 #include "sinks/file_sink.hpp"
 #include "sinks/rotating_file_sink.hpp"
@@ -32,6 +33,10 @@ public:
         // 通用键值属性（filename、max_size_mb 等）
         std::unordered_map<std::string, std::string> properties;
 
+        bool        async = false;
+        std::size_t queue_size = 8192;
+        std::string overflow_policy;
+
         // 链式构建器
         template<typename SinkType>
         SinkDef& set_class() {
@@ -49,12 +54,15 @@ public:
             return *this;
         }
 
-        SinkDef& set_level(LogLevel level) { level = level; return *this; }
+        SinkDef& set_level(LogLevel level) { this->level = level; return *this; }
         SinkDef& set_formatter(std::string pattern) { formatter = std::move(pattern); return *this; }
         SinkDef& set_property(std::string key, std::string value) {
             properties[std::move(key)] = std::move(value);
             return *this;
         }
+        SinkDef& set_async(bool a = true) { async = a; return *this; }
+        SinkDef& set_queue_size(std::size_t qs) { queue_size = qs; return *this; }
+        SinkDef& set_overflow_policy(std::string policy) { overflow_policy = std::move(policy); return *this; }
     };
 
     // ── Logger 定义 ──────────────────────────────────
@@ -110,6 +118,7 @@ private:
     friend class ConfigLoader;
 
     std::shared_ptr<Sink> create_sink_from_def(const SinkDef& def) const;
+    static std::shared_ptr<Sink> wrap_async(std::shared_ptr<Sink> inner, std::size_t queue_size, const std::string& overflow_policy);
 
     std::unordered_map<std::string, SinkDef>      sinks_;
     std::unordered_map<std::string, LoggerDef>    loggers_;
@@ -154,7 +163,38 @@ inline std::string Config::env(const std::string& key, const std::string& defaul
     return val ? std::string(val) : default_val;
 }
 
+inline std::shared_ptr<Sink> Config::wrap_async(std::shared_ptr<Sink> inner, std::size_t queue_size, const std::string& overflow_policy) {
+    OverflowPolicy policy = (overflow_policy == "drop_newest")
+        ? OverflowPolicy::DROP_NEWEST
+        : OverflowPolicy::BLOCK;
+
+    switch (queue_size) {
+        case 4096:
+            if (policy == OverflowPolicy::DROP_NEWEST)
+                return std::make_shared<AsyncSink<4096, OverflowPolicy::DROP_NEWEST>>(std::move(inner));
+            else
+                return std::make_shared<AsyncSink<4096, OverflowPolicy::BLOCK>>(std::move(inner));
+        case 16384:
+            if (policy == OverflowPolicy::DROP_NEWEST)
+                return std::make_shared<AsyncSink<16384, OverflowPolicy::DROP_NEWEST>>(std::move(inner));
+            else
+                return std::make_shared<AsyncSink<16384, OverflowPolicy::BLOCK>>(std::move(inner));
+        case 32768:
+            if (policy == OverflowPolicy::DROP_NEWEST)
+                return std::make_shared<AsyncSink<32768, OverflowPolicy::DROP_NEWEST>>(std::move(inner));
+            else
+                return std::make_shared<AsyncSink<32768, OverflowPolicy::BLOCK>>(std::move(inner));
+        default:
+            if (policy == OverflowPolicy::DROP_NEWEST)
+                return std::make_shared<AsyncSink<8192, OverflowPolicy::DROP_NEWEST>>(std::move(inner));
+            else
+                return std::make_shared<AsyncSink<8192, OverflowPolicy::BLOCK>>(std::move(inner));
+    }
+}
+
 inline std::shared_ptr<Sink> Config::create_sink_from_def(const SinkDef& def) const {
+    std::shared_ptr<Sink> sink;
+
     if (def.class_name == "ConsoleSink") {
         bool use_stderr = false;
         bool colored = true;
@@ -162,10 +202,7 @@ inline std::shared_ptr<Sink> Config::create_sink_from_def(const SinkDef& def) co
         if (it != def.properties.end()) use_stderr = (it->second == "true");
         it = def.properties.find("colored");
         if (it != def.properties.end()) colored = (it->second == "true");
-        auto sink = std::make_shared<ConsoleSink>(use_stderr, colored);
-        if (!def.formatter.empty()) sink->set_pattern(def.formatter);
-        sink->set_level(def.level);
-        return sink;
+        sink = std::make_shared<ConsoleSink>(use_stderr, colored);
     }
     else if (def.class_name == "FileSink") {
         std::string filename;
@@ -174,10 +211,7 @@ inline std::shared_ptr<Sink> Config::create_sink_from_def(const SinkDef& def) co
         if (it != def.properties.end()) filename = it->second;
         it = def.properties.find("truncate");
         if (it != def.properties.end()) truncate = (it->second == "true");
-        auto sink = std::make_shared<FileSink>(filename, truncate);
-        if (!def.formatter.empty()) sink->set_pattern(def.formatter);
-        sink->set_level(def.level);
-        return sink;
+        sink = std::make_shared<FileSink>(filename, truncate);
     }
     else if (def.class_name == "RotatingFileSink") {
         std::string filename;
@@ -189,10 +223,7 @@ inline std::shared_ptr<Sink> Config::create_sink_from_def(const SinkDef& def) co
         if (it != def.properties.end()) max_size_mb = std::stoull(it->second);
         it = def.properties.find("max_files");
         if (it != def.properties.end()) max_files = std::stoi(it->second);
-        auto sink = std::make_shared<RotatingFileSink>(filename, max_size_mb, max_files);
-        if (!def.formatter.empty()) sink->set_pattern(def.formatter);
-        sink->set_level(def.level);
-        return sink;
+        sink = std::make_shared<RotatingFileSink>(filename, max_size_mb, max_files);
     }
     else if (def.class_name == "DailyFileSink") {
         std::string filename_pattern;
@@ -208,10 +239,7 @@ inline std::shared_ptr<Sink> Config::create_sink_from_def(const SinkDef& def) co
         }
         it = def.properties.find("max_files");
         if (it != def.properties.end()) max_files = std::stoi(it->second);
-        auto sink = std::make_shared<DailyFileSink>(filename_pattern, period, max_files);
-        if (!def.formatter.empty()) sink->set_pattern(def.formatter);
-        sink->set_level(def.level);
-        return sink;
+        sink = std::make_shared<DailyFileSink>(filename_pattern, period, max_files);
     }
     else if (def.class_name == "CallbackSink") {
         throw std::runtime_error("CallbackSink cannot be created via Config, use programmatic API instead");
@@ -219,6 +247,15 @@ inline std::shared_ptr<Sink> Config::create_sink_from_def(const SinkDef& def) co
     else {
         throw std::runtime_error("Unknown Sink class: " + def.class_name);
     }
+
+    if (!def.formatter.empty()) sink->set_pattern(def.formatter);
+    sink->set_level(def.level);
+
+    if (def.async) {
+        sink = wrap_async(std::move(sink), def.queue_size, def.overflow_policy);
+    }
+
+    return sink;
 }
 
 inline void Config::apply() const {
