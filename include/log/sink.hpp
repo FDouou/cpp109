@@ -39,19 +39,19 @@ public:
         flush_impl();
     }
 
-    void set_formatter(std::unique_ptr<Formatter> fmt){
+    virtual void set_formatter(std::unique_ptr<Formatter> fmt){
         std::lock_guard<std::mutex> lock(mutex_);
         formatter_ = std::move(fmt);
     }
-    Formatter* formatter() noexcept { return formatter_.get(); }
+    virtual Formatter* formatter() noexcept { return formatter_.get(); }
 
-    void set_level(LogLevel level) noexcept {
+    virtual void set_level(LogLevel level) noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
         level_ = level; 
     }
     LogLevel level() const noexcept { return level_; }
 
-    void set_pattern(const std::string& pattern){
+    virtual void set_pattern(const std::string& pattern){
         std::lock_guard<std::mutex> lock(mutex_);
         formatter_->set_pattern(pattern);
     }

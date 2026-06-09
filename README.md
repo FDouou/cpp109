@@ -141,12 +141,12 @@ worker_N ───→ RingBuffer_N ───→ bg_thread_N ───→ file_N.
 - **格式化分工**：消息体的 `std::format` 在 worker 线程完成，pattern formatting 由 consumer 线程承担，避免串行瓶颈
 
 > **使用建议**：
-> - AsyncSink 的价值在于 worker 不被 I/O 阻塞——入队 ~2µs 即返回，consumer 后台写盘。
+> - AsyncSink 的价值在于 worker 不被 I/O 阻塞——入队 ~2µs 即返回，consumer 后台写盘
 > - FileSink 等 I/O 密集型 Sink 的 consumer 线程大部分时间阻塞在磁盘写入，实际 CPU 占用极低，
->   线程数可以更宽松（Benchmark 显示 16t async 仍有良好增长）。
-> - ConsoleSink / NullSink 等 CPU 密集型 Sink 的 consumer 持续占用 CPU，总线程数不宜超物理核心。
-> - 不在意 worker 阻塞的场景，sync Sink（内部 `std::lock_guard`）总吞吐更高。
-> - 多线程写同一个文件用 sync Sink，不要用 AsyncSink（SPSC 队列限定单生产者）。
+>   线程数可以更宽松
+> - ConsoleSink / NullSink 等 CPU 密集型 Sink 的 consumer 持续占用 CPU，总线程数不宜超物理核心
+> - 不在意 worker 阻塞的场景，sync Sink（内部 `std::lock_guard`）总吞吐更高
+> - 多线程写同一个文件用 sync Sink，不要用 AsyncSink（SPSC 队列限定单生产者）
 
 ### 构造方式
 

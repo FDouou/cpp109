@@ -25,6 +25,12 @@ public:
     void flush_impl() override;
     void stop();
 
+    void set_formatter(std::unique_ptr<Formatter> fmt) override;
+    void set_level(LogLevel level) noexcept override;
+    void set_pattern(const std::string& pattern) override;
+
+    Formatter* formatter() noexcept override;
+
 protected:
     void write(const std::string&, const LogEvent&) override {}
 
@@ -78,6 +84,7 @@ void AsyncSink<QueueSize, Policy>::log(const LogEvent& event)
 {
     if (event.level() < this->level()) return;
     auto copy = event;
+    //不加锁，cv阻塞超时自动唤醒worker_loop
     queue_.enqueue(std::move(copy));
     cv_.notify_one();
 }
@@ -104,11 +111,37 @@ void AsyncSink<QueueSize, Policy>::worker_loop()
             } catch (...) {}
         } else {
             std::unique_lock<std::mutex> lk(cv_mutex_);
+            //阻塞等待100微秒自动唤醒
             cv_.wait_for(lk, std::chrono::microseconds(100));
         }
     }
 
     wrapped_->flush();
+}
+
+template<std::size_t QueueSize, OverflowPolicy Policy>
+void AsyncSink<QueueSize, Policy>::set_formatter(std::unique_ptr<Formatter> fmt)
+{
+    wrapped_->set_formatter(std::move(fmt));
+}
+
+template<std::size_t QueueSize, OverflowPolicy Policy>
+void AsyncSink<QueueSize, Policy>::set_level(LogLevel level) noexcept
+{
+    level_ = level;
+    wrapped_->set_level(level);
+}
+
+template<std::size_t QueueSize, OverflowPolicy Policy>
+void AsyncSink<QueueSize, Policy>::set_pattern(const std::string& pattern)
+{
+    wrapped_->set_pattern(pattern);
+}
+
+template<std::size_t QueueSize, OverflowPolicy Policy>
+Formatter* AsyncSink<QueueSize, Policy>::formatter() noexcept
+{
+    return wrapped_->formatter();
 }
 
 } // namespace cpp109
