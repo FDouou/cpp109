@@ -38,6 +38,13 @@ private:
 };
 
 template<typename T, std::size_t Size, OverflowPolicy Policy>
+bool RingBuffer<T, Size, Policy>::enqueue(const T& item)
+{
+    T copy = item;
+    return enqueue(std::move(copy));
+}
+
+template<typename T, std::size_t Size, OverflowPolicy Policy>
 bool RingBuffer<T, Size, Policy>::enqueue(T&& item)
 {
     auto wp = write_pos_.load(std::memory_order_relaxed);
