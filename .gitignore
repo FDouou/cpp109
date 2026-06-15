@@ -5,6 +5,7 @@ optimize.md
 
 # 构建产物
 build/
+build_release/
 cmake-build-*/
 CMakeCache.txt
 CMakeFiles/
@@ -22,9 +23,9 @@ CMakeFiles/
 
 # Benchmark 结果
 bench/benchmark.txt
-bench/bench_self.txt
 bench/bench.txt
-bench/bench_spd*
+bench/bench_*.txt
+bench/bench_spdlog.cpp
 
 # IDE
 .vscode/

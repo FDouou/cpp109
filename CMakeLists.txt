@@ -25,7 +25,17 @@ if(NOT LOG109CPP_CXX20_SUPPORTED)
     message(FATAL_ERROR "109cpp requires a C++20 compiler with <format> and <source_location> support")
 endif()
 
+# ── 构建类型 ────────────────────────────────────────────────────────
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 # ── 编译选项 ────────────────────────────────────────────────────────
+if(MSVC)
+    add_compile_options(/O2 /Ob2 /Oi /Ot)
+else()
+    add_compile_options(-O3 -march=native)
+endif()
 # 日志级别编译期开关（可选），低于该级别的宏调用在编译期优化掉
 # add_compile_definitions(LOG109CPP_ACTIVE_LEVEL=2)  # 0=TRACE, 1=DEBUG, 2=INFO ...
 
