@@ -28,8 +28,7 @@
 #include <vector>
 
 #ifdef _WIN32
-    #include <intrin.h>
-    #pragma intrinsic(__rdtsc)
+#include <intrin.h>
 #endif
 
 // -- Custom FrontendOptions: UnboundedUnlimited queue + 4 MiB initial capacity --
