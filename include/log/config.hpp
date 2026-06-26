@@ -164,32 +164,15 @@ inline std::string Config::env(const std::string& key, const std::string& defaul
 }
 
 inline std::shared_ptr<Sink> Config::wrap_async(std::shared_ptr<Sink> inner, std::size_t queue_size, const std::string& overflow_policy) {
+    (void)queue_size; // ByteRingBuffer 内部固定容量
     OverflowPolicy policy = (overflow_policy == "drop_newest")
         ? OverflowPolicy::DROP_NEWEST
         : OverflowPolicy::BLOCK;
 
-    switch (queue_size) {
-        case 4096:
-            if (policy == OverflowPolicy::DROP_NEWEST)
-                return std::make_shared<AsyncSink<4096, OverflowPolicy::DROP_NEWEST>>(std::move(inner));
-            else
-                return std::make_shared<AsyncSink<4096, OverflowPolicy::BLOCK>>(std::move(inner));
-        case 16384:
-            if (policy == OverflowPolicy::DROP_NEWEST)
-                return std::make_shared<AsyncSink<16384, OverflowPolicy::DROP_NEWEST>>(std::move(inner));
-            else
-                return std::make_shared<AsyncSink<16384, OverflowPolicy::BLOCK>>(std::move(inner));
-        case 32768:
-            if (policy == OverflowPolicy::DROP_NEWEST)
-                return std::make_shared<AsyncSink<32768, OverflowPolicy::DROP_NEWEST>>(std::move(inner));
-            else
-                return std::make_shared<AsyncSink<32768, OverflowPolicy::BLOCK>>(std::move(inner));
-        default:
-            if (policy == OverflowPolicy::DROP_NEWEST)
-                return std::make_shared<AsyncSink<8192, OverflowPolicy::DROP_NEWEST>>(std::move(inner));
-            else
-                return std::make_shared<AsyncSink<8192, OverflowPolicy::BLOCK>>(std::move(inner));
-    }
+    if (policy == OverflowPolicy::DROP_NEWEST)
+        return std::make_shared<AsyncSink<OverflowPolicy::DROP_NEWEST>>(std::move(inner));
+    else
+        return std::make_shared<AsyncSink<OverflowPolicy::BLOCK>>(std::move(inner));
 }
 
 inline std::shared_ptr<Sink> Config::create_sink_from_def(const SinkDef& def) const {

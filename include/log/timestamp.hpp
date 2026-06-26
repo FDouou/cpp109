@@ -36,19 +36,29 @@ public:
 private:
     void cache() noexcept {
         auto t = clock::to_time_t(tp_);
-        std::tm tm;
-#ifdef _WIN32
-        localtime_s(&tm, &t);
-#else
-        localtime_r(&t, &tm);
-#endif
-        year_   = tm.tm_year + 1900;
-        month_  = tm.tm_mon + 1;
-        day_    = tm.tm_mday;
-        hour_   = tm.tm_hour;
-        minute_ = tm.tm_min;
-        second_ = tm.tm_sec;
 
+        // thread_local 缓存：同一秒内只需调用一次 localtime_r / localtime_s
+        static thread_local time_t cached_t = 0;
+        static thread_local std::tm cached_tm{};
+
+        if (t != cached_t) {
+            // 跨秒，重新获取 tm（系统调用）
+#ifdef _WIN32
+            localtime_s(&cached_tm, &t);
+#else
+            localtime_r(&t, &cached_tm);
+#endif
+            cached_t = t;
+        }
+
+        year_   = cached_tm.tm_year + 1900;
+        month_  = cached_tm.tm_mon + 1;
+        day_    = cached_tm.tm_mday;
+        hour_   = cached_tm.tm_hour;
+        minute_ = cached_tm.tm_min;
+        second_ = cached_tm.tm_sec;
+
+        // 毫秒/微秒每条日志不同，必须每次计算
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             tp_.time_since_epoch()).count();
         millisecond_ = static_cast<int>(ms % 1000);

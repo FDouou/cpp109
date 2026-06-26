@@ -1,0 +1,46 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "deepseek/deepseek-v4-pro",
+  "default_agent": "main",
+  "agent": {
+    "main": {
+      "mode": "primary",
+      "model": "deepseek/deepseek-v4-pro",
+      "description": "Main agent powered by deepseek-v4-pro"
+    },
+    "coder": {
+      "mode": "subagent",
+      "model": "deepseek/deepseek-v4-flash",
+      "description": "Code implementation expert"
+    },
+    "debugger": {
+      "mode": "subagent",
+      "model": "deepseek/deepseek-v4-flash",
+      "description": "Debugging expert"
+    },
+    "explore": {
+      "mode": "subagent",
+      "model": "deepseek/deepseek-v4-flash",
+      "description": "Codebase exploration agent"
+    },
+    "general": {
+      "mode": "subagent",
+      "model": "deepseek/deepseek-v4-flash",
+      "description": "General-purpose research agent"
+    },
+    "reviewer": {
+      "mode": "subagent",
+      "model": "deepseek/deepseek-v4-flash",
+      "description": "Code review agent"
+    },
+    "tester": {
+      "mode": "subagent",
+      "model": "deepseek/deepseek-v4-flash",
+      "description": "Testing expert"
+    }
+  },
+  "permission": {
+    "edit": "allow",
+    "bash": "allow"
+  }
+}

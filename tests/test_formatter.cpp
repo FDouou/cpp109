@@ -19,7 +19,7 @@ CPP109_TEST(default_pattern)
         cpp109::LogLevel::INFO,
         "hello formatter",
         cpp109::Timestamp(),
-        std::source_location::current(),
+        cpp109::SourceLoc{__FILE__, __LINE__, __func__},
         12345
     );
 
@@ -39,7 +39,7 @@ CPP109_TEST(custom_pattern)
         cpp109::LogLevel::WARN,
         "custom pattern test",
         cpp109::Timestamp(),
-        std::source_location::current(),
+        cpp109::SourceLoc{__FILE__, __LINE__, __func__},
         0
     );
 
@@ -58,7 +58,7 @@ CPP109_TEST(custom_pattern_level_lowercase)
         cpp109::LogLevel::ERROR,
         "lowercase level",
         cpp109::Timestamp(),
-        std::source_location::current(),
+        cpp109::SourceLoc{__FILE__, __LINE__, __func__},
         0
     );
 
@@ -77,7 +77,7 @@ CPP109_TEST(escape_percent)
         cpp109::LogLevel::INFO,
         "percent test",
         cpp109::Timestamp(),
-        std::source_location::current(),
+        cpp109::SourceLoc{__FILE__, __LINE__, __func__},
         0
     );
 
@@ -95,7 +95,7 @@ CPP109_TEST(colored_formatter)
         cpp109::LogLevel::ERROR,
         "colored output",
         cpp109::Timestamp(),
-        std::source_location::current(),
+        cpp109::SourceLoc{__FILE__, __LINE__, __func__},
         0
     );
 

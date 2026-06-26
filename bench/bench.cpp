@@ -1,4 +1,5 @@
 #include "log/log.hpp"
+#include "log/platform.hpp"
 #include "log/sinks/null_sink.hpp"
 #include <algorithm>
 #include <atomic>
@@ -11,6 +12,10 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#ifdef __linux__
+    #include <pthread.h>
+#endif
 
 #ifdef _WIN32
     #include <windows.h>
@@ -65,9 +70,9 @@
 
 namespace {
 
-constexpr int WARMUP_SEC = 3;
+constexpr int WARMUP_SEC = 2;
 constexpr int MEASURE_SEC = 10;
-constexpr int WORK_US    = 10;
+constexpr int WORK_US    = 50;
 
 #ifdef _WIN32
 void simulated_work()
@@ -377,6 +382,87 @@ BenchResult bench_multi(int n, bool with_work)
             (double)MEASURE_SEC, cpu_elapsed, rss_delta, {0, 0, 0}};
 }
 
+// ── 多线程 — 每线程独立 async sink + 亲和性绑定 ────────
+
+BenchResult bench_multi_affinity(int n, bool with_work, const std::vector<int>& bg_cpus)
+{
+    size_t rss_before = current_rss_mb();
+
+    std::vector<std::string> paths;
+    std::vector<std::shared_ptr<cpp109::Logger>> loggers;
+    std::vector<std::shared_ptr<cpp109::AsyncSink<>>> sinks;
+
+    cpp109::BackgroundCpuPool pool(bg_cpus);
+
+    for (int i = 0; i < n; ++i) {
+        std::string p = "__bma_" + std::to_string(i) + ".log";
+        paths.push_back(p);
+        std::remove(p.c_str());
+        auto sink = cpp109::make_async_sink<cpp109::FileSink>(p, true);
+        auto affinity = pool.next();
+        sink->set_affinity(std::move(affinity));
+        sinks.push_back(sink);
+        auto l = cpp109::get_logger("__bma_" + std::to_string(i));
+        l->clear_sinks();
+        l->set_level(cpp109::LogLevel::TRACE);
+        l->add_sink(sink);
+        loggers.push_back(l);
+    }
+
+    std::atomic<uint64_t> total{0};
+    std::atomic<bool> warmup{true};
+    std::atomic<bool> running{true};
+
+    auto worker = [&](int id) {
+        auto& l = loggers[id];
+        uint64_t local = 0;
+        while (warmup) {
+            l->info("w{} {}", id, local);
+            if (with_work) simulated_work();
+            ++local;
+        }
+        while (running) {
+            l->info("r{} {}", id, local);
+            if (with_work) simulated_work();
+            ++local;
+        }
+        total += local;
+    };
+
+    std::vector<std::thread> threads;
+    for (int i = 0; i < n; ++i)
+        threads.emplace_back(worker, i);
+
+    std::this_thread::sleep_for(std::chrono::seconds(WARMUP_SEC));
+    total.store(0);
+    warmup = false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    double cpu_before = process_cpu_sec();
+    size_t rss_peak = current_rss_mb();
+
+    std::this_thread::sleep_for(std::chrono::seconds(MEASURE_SEC));
+    double cpu_elapsed = process_cpu_sec() - cpu_before;
+    running = false;
+
+    for (auto& t : threads) t.join();
+    for (auto& s : sinks) s->flush();
+
+    uint64_t actual = 0;
+    for (const auto& p : paths) {
+        actual += count_lines(p.c_str());
+        std::remove(p.c_str());
+    }
+
+    sinks.clear();
+    loggers.clear();
+
+    size_t rss_delta = (rss_peak > rss_before) ? (rss_peak - rss_before) : 0;
+    std::string tag = std::to_string(n) + "t async+affinity" + (with_work ? " + work" : "");
+    return {"cpp109 " + tag, n, total.load(), actual,
+            (double)MEASURE_SEC, cpu_elapsed, rss_delta, {0, 0, 0}};
+}
+
 // ── 多线程 — NullSink 异步（排除磁盘 I/O 瓶颈）──────────
 
 BenchResult bench_multi_nullsink(int n, bool with_work)
@@ -510,6 +596,112 @@ BenchResult bench_multi_sync_nullsink(int n, bool with_work)
             (double)MEASURE_SEC, cpu_elapsed, rss_delta, {0, 0, 0}};
 }
 
+// ── 多线程 — 动态绑核策略对比 ──────────────────────────
+
+BenchResult bench_multi_strategy(int n, bool with_work,
+                                 int strategy,
+                                 const std::vector<int>& worker_cpus,
+                                 const std::vector<int>& bg_cpus)
+{
+    size_t rss_before = current_rss_mb();
+
+    std::vector<std::string> paths;
+    std::vector<std::shared_ptr<cpp109::Logger>> loggers;
+    std::vector<std::shared_ptr<cpp109::AsyncSink<>>> sinks;
+
+    cpp109::BackgroundCpuPool pool(bg_cpus);
+
+    for (int i = 0; i < n; ++i) {
+        std::string p = "__bms_" + std::to_string(i) + ".log";
+        paths.push_back(p);
+        std::remove(p.c_str());
+        auto sink = cpp109::make_async_sink<cpp109::FileSink>(p, true);
+
+        if (strategy >= 1) {
+            auto affinity = pool.next();
+            sink->set_affinity(std::move(affinity));
+        }
+
+        sinks.push_back(sink);
+        auto l = cpp109::get_logger("__bms_" + std::to_string(i));
+        l->clear_sinks();
+        l->set_level(cpp109::LogLevel::TRACE);
+        l->add_sink(sink);
+        loggers.push_back(l);
+    }
+
+    std::atomic<uint64_t> total{0};
+    std::atomic<bool> warmup{true};
+    std::atomic<bool> running{true};
+
+    auto worker = [&](int id) {
+        if (strategy == 2) {
+#ifdef _WIN32
+            cpp109::platform::set_thread_affinity(
+                ::GetCurrentThread(), worker_cpus.data(), worker_cpus.size());
+#else
+            cpp109::platform::set_thread_affinity(
+                pthread_self(), worker_cpus.data(), worker_cpus.size());
+#endif
+        }
+
+        auto& l = loggers[id];
+        uint64_t local = 0;
+        while (warmup) {
+            l->info("w{} {}", id, local);
+            if (with_work) simulated_work();
+            ++local;
+        }
+        while (running) {
+            l->info("r{} {}", id, local);
+            if (with_work) simulated_work();
+            ++local;
+        }
+        total += local;
+    };
+
+    std::vector<std::thread> threads;
+    for (int i = 0; i < n; ++i)
+        threads.emplace_back(worker, i);
+
+    std::this_thread::sleep_for(std::chrono::seconds(WARMUP_SEC));
+    total.store(0);
+    warmup = false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    double cpu_before = process_cpu_sec();
+    size_t rss_peak = current_rss_mb();
+
+    std::this_thread::sleep_for(std::chrono::seconds(MEASURE_SEC));
+    double cpu_elapsed = process_cpu_sec() - cpu_before;
+    running = false;
+
+    for (auto& t : threads) t.join();
+    for (auto& s : sinks) s->flush();
+
+    uint64_t actual = 0;
+    for (const auto& p : paths) {
+        actual += count_lines(p.c_str());
+        std::remove(p.c_str());
+    }
+
+    sinks.clear();
+    loggers.clear();
+
+    size_t rss_delta = (rss_peak > rss_before) ? (rss_peak - rss_before) : 0;
+
+    std::string strategy_name;
+    switch (strategy) {
+        case 0: strategy_name = "no_affinity"; break;
+        case 1: strategy_name = "bg_only"; break;
+        case 2: strategy_name = "iso K=" + std::to_string(bg_cpus.size()); break;
+        default: strategy_name = "s" + std::to_string(strategy); break;
+    }
+    std::string tag = std::to_string(n) + "t " + strategy_name + (with_work ? " + work" : "");
+    return {"cpp109 " + tag, n, total.load(), actual,
+            (double)MEASURE_SEC, cpu_elapsed, rss_delta, {0, 0, 0}};
+}
+
 } // anonymous namespace
 
 int main()
@@ -526,53 +718,233 @@ int main()
 
     print_result(bench_sync("sync, no work", false));
     cpp109::Registry::instance().remove_all();
-    print_result(bench_sync("sync + work", true));
-    cpp109::Registry::instance().remove_all();
     print_result(bench_async("async, no work", false));
     cpp109::Registry::instance().remove_all();
     print_result(bench_async("async + work", true));
     cpp109::Registry::instance().remove_all();
 
-    // ── Section 2: 多线程，无工作负载 ─────────────────────
-    print_mt_header("2. Multi-thread async (no work, per-thread async sink)");
-    for (int n : {4, 8, 16, 32, 64}) {
+    // ── Section 2: 多线程 async（per-thread 独立 sink + 文件）────
+    print_mt_header("2. Multi-thread async (per-thread async sink + file)");
+    for (int n : {4, 8, 16, 32}) {
         print_mt_result(bench_multi(n, false));
         cpp109::Registry::instance().remove_all();
     }
 
-    // ── Section 3: 多线程，模拟工作负载 ───────────────────
-    print_mt_header("3. Multi-thread async + 10us work (per-thread async sink)");
-    for (int n : {4, 8, 16, 32, 64}) {
-        print_mt_result(bench_multi(n, true));
-        cpp109::Registry::instance().remove_all();
-    }
-
-    // ── Section 4: NullSink 异步（排除磁盘 I/O）────────────
-    print_mt_header("4. Multi-thread async+null (no disk, isolate ringbuffer overhead)");
-    for (int n : {4, 8, 16, 32, 64}) {
+    // ── Section 3: 多线程 async+null（排除磁盘 I/O）────────────
+    print_mt_header("3. Multi-thread async+null (no disk, isolate ringbuffer overhead)");
+    for (int n : {4, 8, 16, 32}) {
         print_mt_result(bench_multi_nullsink(n, false));
         cpp109::Registry::instance().remove_all();
     }
 
-    // ── Section 5: NullSink 异步 + 工作负载 ───────────────
-    print_mt_header("5. Multi-thread async+null + 10us work (no disk)");
-    for (int n : {4, 8, 16, 32, 64}) {
-        print_mt_result(bench_multi_nullsink(n, true));
-        cpp109::Registry::instance().remove_all();
-    }
-
-    // ── Section 6: NullSink 同步（纯 logger 开销基线）─────
-    print_mt_header("6. Multi-thread sync+null (raw logger overhead, no ringbuffer)");
-    for (int n : {4, 8, 16, 32, 64}) {
+    // ── Section 4: 多线程 sync+null（纯 logger 开销基线）─────────
+    print_mt_header("4. Multi-thread sync+null (raw logger overhead, no ringbuffer)");
+    for (int n : {4, 8, 16, 32}) {
         print_mt_result(bench_multi_sync_nullsink(n, false));
         cpp109::Registry::instance().remove_all();
     }
 
-    // ── Section 7: NullSink 同步 + 工作负载 ───────────────
-    print_mt_header("7. Multi-thread sync+null + 10us work (raw overhead)");
-    for (int n : {4, 8, 16, 32, 64}) {
-        print_mt_result(bench_multi_sync_nullsink(n, true));
+    // ── Section 5: 多线程 async + 亲和性（worker 绑核）───────────
+    print_mt_header("5. Multi-thread async + affinity (worker pinned to bg cpu pool)");
+    {
+        unsigned int total_cpus = cpp109::platform::cpu_count();
+        std::vector<int> bg;
+        for (unsigned int i = (total_cpus >= 4 ? total_cpus - 4 : 0); i < total_cpus; ++i)
+            bg.push_back(static_cast<int>(i));
+        for (int n : {4, 8, 16, 32}) {
+            print_mt_result(bench_multi_affinity(n, false, bg));
+            cpp109::Registry::instance().remove_all();
+        }
+    }
+
+    // ── Section 6: 绑核策略完整矩阵（工作CPU密集 + 后台IO密集）──────────
+    print_mt_header("6. Affinity strategy matrix (CPU+IO mixed, with_work=true)");
+    {
+        unsigned int P = cpp109::platform::cpu_count();
+        tee_printf("  CPU logical cores: %u\n\n", P);
+
+        // 辅助 lambda：生成 [start, end) 的核列表
+        auto range = [](int start, int end) {
+            std::vector<int> v;
+            for (int i = start; i < end; ++i) v.push_back(i);
+            return v;
+        };
+
+        // ── 场景 A：模拟 8 核（核 0-7）──────────────────────────
+        tee_printf("  --- Scenario A: 8 cores (cpu 0-7) ---\n");
+        // A1: 8+8 线程
+        for (int K : {1, 2, 3, 4}) {
+            auto bg = range(8 - K, 8);
+            auto wc = range(0, 8 - K);
+            print_mt_result(bench_multi_strategy(8, true, 2, wc, bg));
+            cpp109::Registry::instance().remove_all();
+        }
+        // A1 baseline
+        print_mt_result(bench_multi_strategy(8, true, 0, {}, {}));
         cpp109::Registry::instance().remove_all();
+
+        // A2: 32+32 线程（严重超订）
+        for (int K : {2, 4}) {
+            auto bg = range(8 - K, 8);
+            auto wc = range(0, 8 - K);
+            print_mt_result(bench_multi_strategy(32, true, 2, wc, bg));
+            cpp109::Registry::instance().remove_all();
+        }
+        // A2 baseline
+        print_mt_result(bench_multi_strategy(32, true, 0, {}, {}));
+        cpp109::Registry::instance().remove_all();
+
+        // ── 场景 B：模拟 16 核（核 0-15）─────────────────────────
+        tee_printf("  --- Scenario B: 16 cores (cpu 0-15) ---\n");
+        // B1: 16+16 线程
+        for (int K : {2, 4, 8}) {
+            auto bg = range(16 - K, 16);
+            auto wc = range(0, 16 - K);
+            print_mt_result(bench_multi_strategy(16, true, 2, wc, bg));
+            cpp109::Registry::instance().remove_all();
+        }
+        // B1 baseline
+        print_mt_result(bench_multi_strategy(16, true, 0, {}, {}));
+        cpp109::Registry::instance().remove_all();
+
+        // B2: 32+32 线程（超订）
+        for (int K : {4, 8}) {
+            auto bg = range(16 - K, 16);
+            auto wc = range(0, 16 - K);
+            print_mt_result(bench_multi_strategy(32, true, 2, wc, bg));
+            cpp109::Registry::instance().remove_all();
+        }
+        // B2 baseline
+        print_mt_result(bench_multi_strategy(32, true, 0, {}, {}));
+        cpp109::Registry::instance().remove_all();
+
+        // ── 场景 C：全 P 核 ───────────────────────────────────
+        tee_printf("  --- Scenario C: %u cores (full) ---\n", P);
+        int Pc = (int)P;
+        // C1: 16+16 线程
+        for (int K : {2, 4, 6, 8}) {
+            auto bg = range(Pc - K, Pc);
+            auto wc = range(0, Pc - K);
+            print_mt_result(bench_multi_strategy(16, true, 2, wc, bg));
+            cpp109::Registry::instance().remove_all();
+        }
+        // C1 baseline
+        print_mt_result(bench_multi_strategy(16, true, 0, {}, {}));
+        cpp109::Registry::instance().remove_all();
+
+        // C2: 32+32 线程（超订）
+        for (int K : {4, 8, 12}) {
+            auto bg = range(Pc - K, Pc);
+            auto wc = range(0, Pc - K);
+            print_mt_result(bench_multi_strategy(32, true, 2, wc, bg));
+            cpp109::Registry::instance().remove_all();
+        }
+        // C2 baseline
+        print_mt_result(bench_multi_strategy(32, true, 0, {}, {}));
+        cpp109::Registry::instance().remove_all();
+
+        // ── 场景 D：拓扑感知绑核（工作线程独占物理核，后台用超线程对）──
+        {
+            auto topo = cpp109::platform::get_cpu_topology();
+            int phys = static_cast<int>(topo.physical_count());
+            auto smt_first  = topo.first_logical_of_each();   // 每物理核第1逻辑核
+            auto smt_second = topo.second_logical_of_smt();   // P-core超线程第2逻辑核
+
+            tee_printf("  --- Scenario D: topology-aware (workers=1 logical per physical core, bg=SMT sibling) ---\n");
+            tee_printf("  Physical cores: %d, SMT pairs: %zu, workers first-logical: %zu, bg SMT-second: %zu\n\n",
+                       phys, smt_second.size(), smt_first.size(), smt_second.size());
+
+            // D1: 16+16 线程
+            // 工作：前 min(16, physical_count) 个物理核的 first_logical（1:1 物理核独占）
+            // 后台：SMT second logical（P-core 超线程对，IO 阻塞不争执行单元）
+            {
+                std::vector<int> wc(smt_first.begin(),
+                                    smt_first.begin() + std::min(smt_first.size(), static_cast<std::size_t>(16)));
+                std::vector<int> bg = smt_second;
+                print_mt_result(bench_multi_strategy(16, true, 2, wc, bg));
+                cpp109::Registry::instance().remove_all();
+            }
+            // D1 baseline（无绑核）
+            print_mt_result(bench_multi_strategy(16, true, 0, {}, {}));
+            cpp109::Registry::instance().remove_all();
+
+            // D2: 32+32 线程（超订）
+            {
+                std::vector<int> wc(smt_first.begin(),
+                                    smt_first.begin() + std::min(smt_first.size(), static_cast<std::size_t>(16)));
+                std::vector<int> bg = smt_second;
+                print_mt_result(bench_multi_strategy(32, true, 2, wc, bg));
+                cpp109::Registry::instance().remove_all();
+            }
+            // D2 baseline（无绑核）
+            print_mt_result(bench_multi_strategy(32, true, 0, {}, {}));
+            cpp109::Registry::instance().remove_all();
+        }
+
+        // ── 场景 E：8核/16核模拟下的拓扑绑核（2:1超订，验证挽回损失）──
+        {
+            auto topo = cpp109::platform::get_cpu_topology();
+            auto smt_first  = topo.first_logical_of_each();
+            auto smt_second = topo.second_logical_of_smt();
+
+            tee_printf("  --- Scenario E: topology-aware on limited cores (2:1 oversubscription) ---\n");
+            tee_printf("  Physical cores: %zu, SMT pairs: %zu\n\n",
+                       topo.physical_count(), smt_second.size());
+
+            // E1: 模拟 8 物理核，8+8 线程（2:1 超订）
+            {
+                int lim = 8;
+                std::vector<int> wc(smt_first.begin(),
+                                    smt_first.begin() + std::min(static_cast<size_t>(lim), smt_first.size()));
+                std::vector<int> bg;
+                for (size_t i = 0; i < std::min(static_cast<size_t>(lim), topo.physical_cores.size()); ++i) {
+                    const auto& c = topo.physical_cores[i];
+                    if (c.logical_cpus.size() >= 2) bg.push_back(c.logical_cpus[1]);
+                }
+                tee_printf("  E1: 8 phys cores, 8+8 threads, workers=%zu cores, bg=%zu cores\n", wc.size(), bg.size());
+                print_mt_result(bench_multi_strategy(8, true, 2, wc, bg));
+                cpp109::Registry::instance().remove_all();
+                // baseline
+                print_mt_result(bench_multi_strategy(8, true, 0, {}, {}));
+                cpp109::Registry::instance().remove_all();
+            }
+
+            // E2: 模拟 16 物理核，16+16 线程（2:1 超订）
+            {
+                int lim = 16;
+                std::vector<int> wc(smt_first.begin(),
+                                    smt_first.begin() + std::min(static_cast<size_t>(lim), smt_first.size()));
+                std::vector<int> bg;
+                for (size_t i = 0; i < std::min(static_cast<size_t>(lim), topo.physical_cores.size()); ++i) {
+                    const auto& c = topo.physical_cores[i];
+                    if (c.logical_cpus.size() >= 2) bg.push_back(c.logical_cpus[1]);
+                }
+                tee_printf("  E2: 16 phys cores, 16+16 threads, workers=%zu cores, bg=%zu cores\n", wc.size(), bg.size());
+                print_mt_result(bench_multi_strategy(16, true, 2, wc, bg));
+                cpp109::Registry::instance().remove_all();
+                // baseline
+                print_mt_result(bench_multi_strategy(16, true, 0, {}, {}));
+                cpp109::Registry::instance().remove_all();
+            }
+
+            // E3: 模拟 16 物理核，32+32 线程（4:1 严重超订）
+            {
+                int lim = 16;
+                std::vector<int> wc(smt_first.begin(),
+                                    smt_first.begin() + std::min(static_cast<size_t>(lim), smt_first.size()));
+                std::vector<int> bg;
+                for (size_t i = 0; i < std::min(static_cast<size_t>(lim), topo.physical_cores.size()); ++i) {
+                    const auto& c = topo.physical_cores[i];
+                    if (c.logical_cpus.size() >= 2) bg.push_back(c.logical_cpus[1]);
+                }
+                tee_printf("  E3: 16 phys cores, 32+32 threads, workers=%zu cores, bg=%zu cores\n", wc.size(), bg.size());
+                print_mt_result(bench_multi_strategy(32, true, 2, wc, bg));
+                cpp109::Registry::instance().remove_all();
+                // baseline
+                print_mt_result(bench_multi_strategy(32, true, 0, {}, {}));
+                cpp109::Registry::instance().remove_all();
+            }
+        }
     }
 
     tee_printf("\n");

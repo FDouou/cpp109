@@ -96,3 +96,15 @@ add_test(NAME test_macros COMMAND test_macros)
 # ── 性能基准（手动运行，不加入 ctest）────────────────────────────
 add_executable(bench bench/bench.cpp)
 target_link_libraries(bench 109cpp)
+
+add_executable(bench_latency bench/bench_latency.cpp)
+target_link_libraries(bench_latency 109cpp)
+
+add_executable(bench_latency_breakdown bench/bench_latency_breakdown.cpp)
+target_link_libraries(bench_latency_breakdown 109cpp)
+
+add_executable(bench_latency_instrumented bench/bench_latency_instrumented.cpp)
+target_link_libraries(bench_latency_instrumented 109cpp)
+
+add_executable(batch_test bench/batch_test.cpp)
+target_link_libraries(batch_test 109cpp)

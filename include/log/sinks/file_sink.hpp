@@ -57,7 +57,7 @@ protected:
 private:
     std::string filename_;
     std::FILE*  file_ = nullptr;
-    int         flush_interval_ms_ = 0;
+    int         flush_interval_ms_ = 1000;
     std::chrono::steady_clock::time_point last_flush_time_ = std::chrono::steady_clock::now();
 };
 

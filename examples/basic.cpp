@@ -1,4 +1,4 @@
-ï»¿// basic.cpp â€” åŸºç¡€ç”¨æ³•ç¤ºä¾‹
+// basic.cpp ¡ª »ù´¡ÓÃ·¨Ê¾Àý
 
 #include "../include/log/log.hpp"
 #include <thread>

@@ -23,10 +23,12 @@ protected:
     void write(const std::string& formatted_msg, const LogEvent& event) override{
         if(colored_){
             platform::set_console_color(level_to_console_color(event.level()));
-            fprintf(target_, "%s\n", formatted_msg.c_str());
+            fputs(formatted_msg.c_str(), target_);
+            fputc('\n', target_);
             platform::reset_console_color();
         }else{
-            fprintf(target_, "%s\n", formatted_msg.c_str());
+            fputs(formatted_msg.c_str(), target_);
+            fputc('\n', target_);
         }
     }
     void flush_impl() override{

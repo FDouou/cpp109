@@ -67,7 +67,7 @@ CPP109_TEST(async_sink_basic)
                 cpp109::LogLevel::INFO,
                 std::string("async message ") + std::to_string(i),
                 cpp109::Timestamp(),
-                std::source_location::current(),
+                cpp109::SourceLoc{__FILE__, __LINE__, __func__},
                 0
             );
             async->log(event);

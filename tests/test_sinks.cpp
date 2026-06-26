@@ -24,7 +24,7 @@ CPP109_TEST(console_sink)
         cpp109::LogLevel::INFO,
         "hello console",
         cpp109::Timestamp(),
-        std::source_location::current(),
+        cpp109::SourceLoc{__FILE__, __LINE__, __func__},
         0
     );
 
@@ -45,7 +45,7 @@ CPP109_TEST(file_sink)
             cpp109::LogLevel::INFO,
             "hello file",
             cpp109::Timestamp(),
-            std::source_location::current(),
+            cpp109::SourceLoc{__FILE__, __LINE__, __func__},
             0
         );
 
@@ -77,7 +77,7 @@ CPP109_TEST(rotating_file_sink)
                 cpp109::LogLevel::INFO,
                 std::string("rotating message ") + std::to_string(i),
                 cpp109::Timestamp(),
-                std::source_location::current(),
+                cpp109::SourceLoc{__FILE__, __LINE__, __func__},
                 0
             );
             sink->log(event);
@@ -108,7 +108,7 @@ CPP109_TEST(callback_sink)
         cpp109::LogLevel::INFO,
         "callback triggered",
         cpp109::Timestamp(),
-        std::source_location::current(),
+        cpp109::SourceLoc{__FILE__, __LINE__, __func__},
         0
     );
 
