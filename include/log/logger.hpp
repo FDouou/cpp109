@@ -71,7 +71,7 @@ public:
     void clear_sinks(){
         std::lock_guard<std::mutex> lock(mutex_);
         sinks_.clear();
-        std::atomic_store_explicit(&fast_sink_, std::shared_ptr<Sink>{nullptr}, std::memory_order_release);
+            fast_sink_.store(std::shared_ptr<Sink>{nullptr}, std::memory_order_release);
         cached_async_sink_ = nullptr;
     }
 
@@ -106,7 +106,7 @@ private:
         SourceLoc loc{sloc.file_name(), static_cast<int>(sloc.line()), sloc.function_name()};
         LogEvent event = {name_, level, std::move(message), Timestamp(), loc, tl_tid};
 
-        auto fast = std::atomic_load_explicit(&fast_sink_, std::memory_order_acquire);
+        auto fast = fast_sink_.load(std::memory_order_acquire);
         if (fast && parent_.expired()) {
             if (level == LogLevel::FATAL) {
                 fast->log(event);
@@ -148,10 +148,10 @@ private:
 
     void update_fast_path_unlocked(){
         if (sinks_.size() == 1) {
-            std::atomic_store_explicit(&fast_sink_, sinks_[0], std::memory_order_release);
+            fast_sink_.store(sinks_[0], std::memory_order_release);
             cached_async_sink_ = dynamic_cast<AsyncSinkBase*>(sinks_[0].get());
         } else {
-            std::atomic_store_explicit(&fast_sink_, std::shared_ptr<Sink>{nullptr}, std::memory_order_release);
+        fast_sink_.store(std::shared_ptr<Sink>{nullptr}, std::memory_order_release);
             cached_async_sink_ = nullptr;
         }
     }
@@ -161,7 +161,7 @@ private:
     std::atomic<bool> propagate_ = true;
     std::weak_ptr<Logger> parent_;
     std::vector<std::shared_ptr<Sink>> sinks_;
-    std::shared_ptr<Sink> fast_sink_;
+    std::atomic<std::shared_ptr<Sink>> fast_sink_{nullptr};
     AsyncSinkBase* cached_async_sink_ = nullptr;
     std::mutex        mutex_;
 };
@@ -243,8 +243,7 @@ private:
         }                                                                        \
         /* fast path 2: sync single sink -> LogEvent + log_move */               \
         auto* fast_sync = cached_async_sink_ ? nullptr                            \
-            : std::atomic_load_explicit(                                          \
-                &fast_sink_, std::memory_order_acquire).get();                    \
+            : fast_sink_.load(std::memory_order_acquire).get();                    \
         if (fast_sync && parent_.expired()) {                                    \
             LogEvent event(name_, level_enum, fmt_str, loc, tl_tid,              \
                            std::forward<Args>(args)...);                         \

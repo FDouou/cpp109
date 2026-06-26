@@ -3,6 +3,7 @@
 #include "sink.hpp"
 #include "log_event.hpp"
 #include "ring_buffer.hpp"
+#include "platform.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -11,6 +12,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace cpp109 {
 
@@ -173,6 +175,16 @@ public:
         if (running_.exchange(false)) {
             cv_.notify_one();
             worker_.join();
+        }
+    }
+
+    // 设置后台 worker 线程的 CPU 亲和性
+    void set_affinity(std::vector<int> cpu_ids) {
+        if (!cpu_ids.empty()) {
+            platform::set_thread_affinity(
+                worker_.native_handle(),
+                cpu_ids.data(),
+                cpu_ids.size());
         }
     }
 

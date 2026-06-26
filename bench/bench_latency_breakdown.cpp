@@ -171,9 +171,9 @@ int main() {
     // 模拟 Logger::do_log 中的 atomic_load_explicit(&fast_sink_, acquire)
     // ═══════════════════════════════════════════════════════════
     {
-        auto sp = std::make_shared<int>(42);
+        std::atomic<std::shared_ptr<int>> sp{std::make_shared<int>(42)};
         auto load_sp = [&]() {
-            volatile auto p = std::atomic_load_explicit(&sp, std::memory_order_acquire);
+            volatile auto p = sp.load(std::memory_order_acquire);
             (void)p;
         };
         for (int i = 0; i < WARMUP; ++i) { load_sp(); }

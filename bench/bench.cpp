@@ -1,5 +1,6 @@
 #include "log/log.hpp"
 #include "log/platform.hpp"
+#include "log/cpu_pool.hpp"
 #include "log/sinks/null_sink.hpp"
 #include <algorithm>
 #include <atomic>

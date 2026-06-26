@@ -32,7 +32,8 @@ endif()
 
 # ── 编译选项 ────────────────────────────────────────────────────────
 if(MSVC)
-    add_compile_options(/O2 /Ob2 /Oi /Ot /utf-8)
+    # Debug 配置默认包含 /Od /RTC1，与 /O2 冲突，因此仅在非 Debug 下启用优化
+    add_compile_options("$<$<NOT:$<CONFIG:Debug>>:/O2 /Ob2 /Oi /Ot>" /utf-8)
 else()
     add_compile_options(-O3 -march=native)
 endif()
