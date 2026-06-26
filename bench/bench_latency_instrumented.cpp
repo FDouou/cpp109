@@ -12,7 +12,9 @@
 
 #include "log/log.hpp"
 
+#ifdef _WIN32
 #include <intrin.h>
+#endif
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
