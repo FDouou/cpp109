@@ -14,8 +14,6 @@ jobs:
         include:
           - os: ubuntu-24.04
             preset: linux
-          - os: macos-latest
-            preset: macos
           - os: windows-latest
             preset: windows
 
