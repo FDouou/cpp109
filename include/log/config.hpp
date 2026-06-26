@@ -34,7 +34,7 @@ public:
         std::unordered_map<std::string, std::string> properties;
 
         bool        async = false;
-        std::size_t queue_size = 8192;
+        std::size_t queue_size = 1 << 20;  // 1MB，与 AsyncSink 默认 ByteRingBuffer 容量一致
         std::string overflow_policy;
 
         // 链式构建器
@@ -164,15 +164,21 @@ inline std::string Config::env(const std::string& key, const std::string& defaul
 }
 
 inline std::shared_ptr<Sink> Config::wrap_async(std::shared_ptr<Sink> inner, std::size_t queue_size, const std::string& overflow_policy) {
-    (void)queue_size; // ByteRingBuffer 内部固定容量
+    // queue_size 在运行时才能确定，无法直接用作非类型模板参数；
+    // 这里使用默认容量 (1<<20)，后续可改为编译期分派以支持更多容量。
+
+    // 略作检查防止传入明显不合理的值
+    if (queue_size < 64) queue_size = 1 << 20;
+
     OverflowPolicy policy = (overflow_policy == "drop_newest")
         ? OverflowPolicy::DROP_NEWEST
         : OverflowPolicy::BLOCK;
 
+    constexpr std::size_t DEF_CAP = 1 << 20;
     if (policy == OverflowPolicy::DROP_NEWEST)
-        return std::make_shared<AsyncSink<OverflowPolicy::DROP_NEWEST>>(std::move(inner));
+        return std::make_shared<AsyncSink<DEF_CAP, OverflowPolicy::DROP_NEWEST>>(std::move(inner));
     else
-        return std::make_shared<AsyncSink<OverflowPolicy::BLOCK>>(std::move(inner));
+        return std::make_shared<AsyncSink<DEF_CAP, OverflowPolicy::BLOCK>>(std::move(inner));
 }
 
 inline std::shared_ptr<Sink> Config::create_sink_from_def(const SinkDef& def) const {

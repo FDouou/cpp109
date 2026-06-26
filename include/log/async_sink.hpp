@@ -57,7 +57,7 @@ private:
 };
 
 // ── AsyncSink：使用 ByteRingBuffer 的异步 sink（final 使编译器可以去虚拟化）──
-template<OverflowPolicy Policy = OverflowPolicy::BLOCK>
+template<std::size_t QueueCapacity = 1 << 20, OverflowPolicy Policy = OverflowPolicy::BLOCK>
 class AsyncSink final : public AsyncSinkBase {
 public:
     explicit AsyncSink(std::shared_ptr<Sink> wrapped)
@@ -238,8 +238,7 @@ private:
         wrapped_->flush();
     }
 
-    static constexpr std::size_t RB_CAP = 1 << 20;
-    ByteRingBuffer<RB_CAP, Policy> ring_;
+    ByteRingBuffer<QueueCapacity, Policy> ring_;
     std::shared_ptr<Sink> wrapped_;
     std::thread             worker_;
     std::atomic<bool>       running_{true};
@@ -250,11 +249,14 @@ private:
 };
 
 // ── 工厂函数 ──
-template<typename SinkType, OverflowPolicy Policy = OverflowPolicy::BLOCK, typename... Args>
-std::shared_ptr<AsyncSink<Policy>> make_async_sink(Args&&... sink_args)
+template<typename SinkType,
+         std::size_t QueueCapacity = 1 << 20,
+         OverflowPolicy Policy = OverflowPolicy::BLOCK,
+         typename... Args>
+std::shared_ptr<AsyncSink<QueueCapacity, Policy>> make_async_sink(Args&&... sink_args)
 {
     auto inner = std::make_shared<SinkType>(std::forward<Args>(sink_args)...);
-    return std::make_shared<AsyncSink<Policy>>(std::move(inner));
+    return std::make_shared<AsyncSink<QueueCapacity, Policy>>(std::move(inner));
 }
 
 } // namespace cpp109

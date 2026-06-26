@@ -13,12 +13,12 @@ namespace cpp109 {
 
 enum class OverflowPolicy;
 
-template<OverflowPolicy>
+template<std::size_t, OverflowPolicy>
 class AsyncSink;
 
 
 class Sink {
-    template<OverflowPolicy>
+    template<std::size_t, OverflowPolicy>
     friend class AsyncSink;
 
 public:

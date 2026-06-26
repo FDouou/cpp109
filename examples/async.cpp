@@ -12,13 +12,14 @@ int main() {
 
     auto async_drop = cpp109::make_async_sink<
         cpp109::FileSink,
+        1 << 20,
         cpp109::OverflowPolicy::DROP_NEWEST
     >("async_drop.log");
     logger->add_sink(async_drop);
 
     auto inner = std::make_shared<cpp109::FileSink>("async_manual.log");
     auto async_manual = std::make_shared<
-        cpp109::AsyncSink<cpp109::OverflowPolicy::DROP_NEWEST>
+        cpp109::AsyncSink<1 << 20, cpp109::OverflowPolicy::DROP_NEWEST>
     >(inner);
     logger->add_sink(async_manual);
 
