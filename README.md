@@ -205,7 +205,7 @@ ctest --test-dir build
 
 ## 性能
 
-> 数字为开发机实测（i9-12900HX / MSVC /O2 / Release，2.5GHz），完整原始数据见 `bench/results/`（本地，不入库）。
+> 数字为开发机实测（i9-12900HX / MSVC /O2 / Release，2.5GHz）
 
 ### 入队延迟
 
