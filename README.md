@@ -120,27 +120,9 @@ logger->add_sink(file);
 
 ## 异步日志
 
-cpp109 的异步层采用 **全局后台 worker + 前台线程分片** 模型：
-
-- 所有 `AsyncSink` 共享进程级 `LogBackend` 的固定数量 worker（默认 1 个），避免 sink 数量增长导致线程膨胀；
-- 每个前台线程首次写某 sink 时懒创建自己的 SPSC 分片队列，写者恒为该线程本身 → 入队无锁、多线程共享同一 sink（同一文件）安全；
-- 后台 worker 遍历各 sink 的所有线程分片，聚合解码后写入底层 Sink（文件只有一个写者）；
-- 队列满时生产者通过条件变量等待（不空转），worker 腾出空间后唤醒。
-
-```
-前台线程                          AsyncSink（分片队列池）                后台
-────────────────────────────────────────────────────────────────────────
-thread_1 ───→ ┌─ slot(t1) ─┐
-thread_2 ───→ ├─ slot(t2) ─┼──→ LogBackend worker ───→ file.log
-thread_3 ───→ └─ slot(t3) ─┘
-```
-
-设计：
-
-- **SPSC 分片入队**：每线程独立分片，入队仅两次原子操作（写位置预留 + 提交），无需锁与 CAS 重试
-- **线程分片**：同一 AsyncSink 可被多线程共享（写同一文件），各线程互不阻塞
-- **条件变量背压**：分片满时生产者休眠等待，worker 排空后唤醒，避免自旋烧 CPU
-- **格式化分工**：消息体 `std::format` 在后台 worker 完成，前台只做二进制编码 + 批量缓冲（4KB thread_local）
+`AsyncSink` 将任意 Sink 包装为异步写入：前台线程只做编码入队（无锁），
+后台由全局 worker 统一消费落盘，多线程共享同一 sink 写同一文件安全。
+（架构细节见本地 `ARCHITECTURE.md`，不入库）
 
 ### 构造方式
 
@@ -155,13 +137,10 @@ auto async_file = std::make_shared<cpp109::AsyncSink<>>(file);
 logger->add_sink(async_file);
 ```
 
-> `AsyncSink` 的模板参数（队列容量/溢出策略）仅为源码兼容保留：
-> 队列已下沉到前台线程分片（统一 1MB / BLOCK），由全局 LogBackend worker 消费。
-
 ### 多线程使用示例（同一 logger / 同一文件）
 
 ```cpp
-// 所有线程共享同一 logger + AsyncSink（写同一文件）——线程分片保证安全
+// 所有线程共享同一 logger + AsyncSink（写同一文件）
 auto logger = cpp109::get_logger("app");
 logger->add_sink(cpp109::make_async_sink<cpp109::FileSink>("app.log"));
 
@@ -170,7 +149,12 @@ std::thread t1([&]{ for (...) logger->info("from thread 1: {}", i); });
 std::thread t2([&]{ for (...) logger->info("from thread 2: {}", i); });
 ```
 
-每线程一个分片队列，线程间互不阻塞；后台单 worker 聚合后串行落盘，文件内无交叉写。
+### 优雅退出
+
+```cpp
+// 进程退出前：提交各线程未满批次并 flush 全部 sink（在日志线程停止后调用）
+cpp109::flush_all_logs();
+```
 
 ## Logger 层级
 
@@ -261,14 +245,14 @@ ctest --test-dir build
 
 ## 性能
 
-> 数字为开发机实测（i9-12900HX / MSVC /O2 / Release，2.5GHz），仅作参考。
+> 数字为开发机实测（i9-12900HX / MSVC /O2 / Release，2.5GHz），完整原始数据见 `bench/results/`（本地，不入库）。
 
 ### 入队延迟（async + NullSink，纯入队路径）
 
-| 场景             | P50      | P99      |
-|-----------------|----------|----------|
-| async + args    | ~18.8 ns | ~55 ns   |
-| async no args   | ~17 ns   | ~55 ns   |
+| 场景             | P50     | P99     |
+|-----------------|---------|---------|
+| async + args    | ~18.4 ns | ~78 ns  |
+| async no args   | ~16.8 ns | ~54 ns  |
 
 - 测量方式：rdtsc，200K 预热 + 2M 测量
 - 队列满时背压用条件变量等待（不空转），P99 长尾主要来自批 flush 与 OS 调度
@@ -277,13 +261,15 @@ ctest --test-dir build
 
 | 线程数 | P50（merged） | P99（merged） |
 |--------|--------------|--------------|
-| 1      | ~19 ns       | ~55 ns       |
-| 2      | ~19 ns       | ~70 ns       |
-| 4      | ~19 ns       | ~140 ns      |
-| 8      | ~19 ns       | ~205 ns      |
+| 1      | ~18.8 ns     | ~54 ns       |
+| 2      | ~18.8 ns     | ~101 ns      |
+| 4      | ~18.4 ns     | ~116 ns      |
+| 8      | ~18.8 ns     | ~149 ns      |
 
-线程分片保证各线程入队互不阻塞；P99 随线程数上升来自后台单 worker 聚合消费与 OS 调度抖动。
+- 每线程独立分片，入队互不阻塞；P99 随线程数上升来自后台单 worker 聚合消费与 OS 调度抖动
+- 实测日志：每线程 100K 样本，barrier 同步后 rdtsc 计时
 
 ### 多线程落盘（async + FileSink，8 线程共享同一文件）
 
-后台单 worker 串行写文件，端到端吞吐受磁盘与格式化限制（数 M msg/s 量级），线程间无锁竞争、无死锁。
+- 后台单 worker 串行写文件，端到端吞吐受磁盘与格式化限制（数 M msg/s 量级）
+- 线程间无锁竞争、无死锁（2/4/8 线程各 2-5 万条并发写同一文件实测通过，无丢行）
