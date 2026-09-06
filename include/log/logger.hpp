@@ -5,6 +5,7 @@
 #include "sink.hpp"
 
 #include <atomic>
+#include <algorithm>
 #include <format>
 #include <source_location>
 #include <memory>
@@ -19,15 +20,58 @@ namespace cpp109 {
 // as one batch to reduce atomic RMW on the ring buffer.
 namespace detail {
     static constexpr std::size_t BATCH_CAPACITY = 4096;
-    inline thread_local std::byte tl_batch_data[BATCH_CAPACITY] = {};
-    inline thread_local std::size_t tl_batch_size = 0;
-    inline thread_local AsyncSinkBase* tl_batch_sink = nullptr;
+
+    struct BatchBuffer;
+
+    // 全局活跃 batch 注册表：用于进程退出前的"全线程 flush"。
+    // 只在 batch 构造/析构时加锁（每线程各一次），热路径无锁。
+    inline std::mutex& batch_registry_mutex() {
+        static std::mutex m;
+        return m;
+    }
+    inline std::vector<BatchBuffer*>& active_batches() {
+        static std::vector<BatchBuffer*> v;
+        return v;
+    }
+
+    // 前台线程的批量提交缓冲区。线程退出（thread_local 析构）时自动提交
+    // 未满批次，避免程序退出时最后一批日志残留在 thread_local 中丢失。
+    struct BatchBuffer {
+        std::byte      data[BATCH_CAPACITY];
+        std::size_t    size = 0;
+        AsyncSinkBase* sink = nullptr;
+
+        BatchBuffer() {
+            std::lock_guard<std::mutex> lk(batch_registry_mutex());
+            active_batches().push_back(this);
+        }
+        ~BatchBuffer() {
+            flush();
+            std::lock_guard<std::mutex> lk(batch_registry_mutex());
+            auto& v = active_batches();
+            v.erase(std::remove(v.begin(), v.end(), this), v.end());
+        }
+
+        void flush() {
+            if (size > 0 && sink) {
+                sink->log_encoded_batch(data, size);
+                size = 0;
+            }
+        }
+    };
+
+    inline thread_local BatchBuffer tl_batch{};
 
     inline void flush_deferred_batch() {
-        if (tl_batch_size > 0 && tl_batch_sink) {
-            tl_batch_sink->log_encoded_batch(tl_batch_data, tl_batch_size);
-            tl_batch_size = 0;
-        }
+        tl_batch.flush();
+    }
+
+    // 提交所有存活线程的未满批次。
+    // 约束：须在全部日志写入线程已停止写入后调用（如进程退出前、线程池 drained 后），
+    // 否则会与正在写入的线程产生数据竞争。
+    inline void flush_all_batches() {
+        std::lock_guard<std::mutex> lk(batch_registry_mutex());
+        for (auto* b : active_batches()) b->flush();
     }
 } // namespace detail
 
@@ -207,15 +251,14 @@ private:
                     ? &detail::decode_and_format<std::decay_t<Args>...>         \
                     : nullptr                                                    \
             };                                                                   \
-            /* 批量缓冲区：积累到 4KB 后一次提交 */                                   \
+            /* 批量缓冲区：积累到 4KB 后一次提交（线程退出时自动提交剩余） */           \
             const std::size_t needed = sizeof(TinyHeader) + args_size;             \
-            std::byte* batch_data = detail::tl_batch_data;                          \
-            std::size_t& batch_sz = detail::tl_batch_size;                         \
-            detail::tl_batch_sink = abase;                                         \
-                                                                                   \
+            std::byte* batch_data = detail::tl_batch.data;                          \
+            std::size_t& batch_sz = detail::tl_batch.size;                         \
+            detail::tl_batch.sink = abase;                                         \
+                                                                                    \
             if (batch_sz + needed > detail::BATCH_CAPACITY && batch_sz > 0) {     \
-                abase->log_encoded_batch(batch_data, batch_sz);                   \
-                batch_sz = 0;                                                      \
+                detail::tl_batch.flush();                                          \
             }                                                                      \
                                                                                    \
             const std::size_t off = batch_sz;                                      \

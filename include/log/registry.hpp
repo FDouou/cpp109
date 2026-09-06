@@ -82,6 +82,19 @@ public:
         loggers_.clear();
     }
 
+    // 全局 flush：提交所有存活线程的未满 batch，并 flush 全部 logger 的 sink。
+    // 约束：须在日志写入线程已停止写入后调用（典型场景：进程退出前、线程池 drained 后）。
+    void flush_all(){
+        detail::flush_all_batches();
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& [name, logger] : loggers_) {
+            logger->flush();
+        }
+        if (auto d = default_logger_.load(std::memory_order_acquire)) {
+            d->flush();
+        }
+    }
+
 private:
     Registry() = default;
     ~Registry() = default;

@@ -23,6 +23,16 @@
 #define CPP109_DEFAULT_LOGGER() \
     cpp109::Registry::instance().default_logger()
 
+namespace cpp109 {
+
+// 进程退出前冲刷全部日志（提交各线程未满 batch + flush 所有 sink）。
+// 应在所有日志写入线程停止后调用。
+inline void flush_all_logs() {
+    Registry::instance().flush_all();
+}
+
+} // namespace cpp109
+
 #define LOG_TRACE(fmt, ...) CPP109_DEFAULT_LOGGER()->trace(fmt, ##__VA_ARGS__)
 #define LOG_DEBUG(fmt, ...) CPP109_DEFAULT_LOGGER()->debug(fmt, ##__VA_ARGS__)
 #define LOG_INFO(fmt, ...)  CPP109_DEFAULT_LOGGER()->info(fmt,  ##__VA_ARGS__)

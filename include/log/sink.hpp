@@ -20,6 +20,7 @@ class AsyncSink;
 class Sink {
     template<std::size_t, OverflowPolicy>
     friend class AsyncSink;
+    friend class AsyncSinkBase;
 
 public:
     Sink(){
@@ -109,10 +110,16 @@ public:
                              std::uint64_t timestamp_tsc,
                              const std::byte* encoded_args, std::uint32_t args_size) = 0;
 
-    // 批量提交预序列化的日志数据。data 指向连续的多条 (LogRecordHeader + args) 记录，
+    // 批量提交预序列化的日志数据。data 指向连续的多条 (TinyHeader + args) 记录，
     // total_bytes 是总字节数。AsyncSink 一次性 prepare_write + memcpy + commit_write，
     // 将多次原子操作合并为一次，大幅降低入队延迟。
     virtual void log_encoded_batch(const std::byte* data, std::size_t total_bytes) = 0;
+
+    // ── LogBackend worker / flush 接口 ──
+    // 后台聚合线程通过这三个接口消费 ring，无需知道 AsyncSink 的具体实现。
+    virtual bool has_pending() const = 0;   // ring 是否还有未处理记录
+    virtual bool drain_one() = 0;           // 取一条记录解码并写入底层 Sink，返回是否处理
+    virtual void flush_wrapped() = 0;       // flush 底层 Sink
 };
 
 } // namespace cpp109

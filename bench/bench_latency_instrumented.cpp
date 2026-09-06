@@ -1,14 +1,19 @@
-// bench_latency_instrumented.cpp — 插桩延迟基准测试
+// bench_latency_instrumented.cpp — 插桩延迟基准（分段剖析异步入队路径）
 //
-// 用 rdtsc 精确测量 cpp109 异步入队每个关键步骤的耗时，输出 P50/P99。
-// 目标是找出延迟瓶颈。
+// 本文件由 bench_latency_instrumented.cpp 与 bench_latency_breakdown.cpp 合并而来：
+//   - 保留 instrumented 的 A/B/C 三段式结构，含真实 logger->info() 宏路径
+//   - 并入 breakdown 独有的参考/旧路径环节（level()、atomic_load(shared_ptr)、
+//     system_clock::now、std::format、thread_local vector::data 等）
+//   - 样本量取 breakdown 的大样本（200K 预热 + 2M 测量）
+//
+// 目标：定位前台线程入队延迟（P50 ~18ns）中每一环节的开销占比。
 //
 // 编译:
 //   cl /std:c++20 /O2 /EHsc /I include bench\bench_latency_instrumented.cpp
 //   g++ -std=c++20 -O2 -I include bench/bench_latency_instrumented.cpp -lpthread
 //
-// 运行: bench_latency_instrumented
-// 预期总运行时间 < 30 秒
+// 运行: build_release\Release\bench_latency_instrumented.exe
+// 提示: 若想快速迭代可把 WARMUP/MEASURE 调小（如 5000 / 50000）。
 
 #include "log/log.hpp"
 
@@ -16,16 +21,17 @@
 #include <intrin.h>
 #endif
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <format>
 #include <memory>
 #include <source_location>
 #include <string>
 #include <thread>
 #include <vector>
-#include <atomic>
 
 // ── rdtsc 封装 ──────────────────────────────────────────────────────
 inline uint64_t rdtsc() noexcept {
@@ -63,7 +69,7 @@ Stats compute_stats(std::vector<uint64_t>& v) {
 
 // ── 打印一行结果（指定格式）─────────────────────────────────────────
 void print_row(int num, const char* name, const Stats& s, double ns_per_cycle) {
-    std::printf("%2d. %-25s P50=%8.0f cyc (%8.1f ns)  P99=%8.0f cyc (%8.1f ns)\n",
+    std::printf("%2d. %-30s P50=%8.0f cyc (%8.1f ns)  P99=%8.0f cyc (%8.1f ns)\n",
         num, name,
         s.p50, s.p50 * ns_per_cycle,
         s.p99, s.p99 * ns_per_cycle);
@@ -97,11 +103,11 @@ int main() {
 
     uint64_t freq = calibrate_rdtsc_freq();
     double ns_per_cycle = 1e9 / static_cast<double>(freq);
-    std::printf("=== Latency Instrumented Benchmark ===\n");
+    std::printf("=== Latency Instrumented Benchmark (merged breakdown) ===\n");
     std::printf("CPU: ~%.2f GHz (%.3f ns/cycle)\n\n", freq / 1e9, ns_per_cycle);
 
-    constexpr int WARMUP  = 5000;
-    constexpr int MEASURE = 50000;
+    constexpr int WARMUP  = 200'000;
+    constexpr int MEASURE = 2'000'000;
 
     // ── 创建 async sink + logger ──────────────────────────────────
     std::remove("__inst.log");
@@ -179,10 +185,44 @@ int main() {
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    // B. 优化后的快路径各环节
+    // B. 前台 Logger / 快路径各环节
     // ═══════════════════════════════════════════════════════════════════
 
-    // ── 5. dynamic_cast<AsyncSinkBase*> 开销 ──────────────────────
+    // ── 5. logger->level() atomic acquire（level check）───────────
+    {
+        for (int i = 0; i < WARMUP; ++i) { volatile auto lvl = logger->level(); (void)lvl; }
+        samples.clear();
+        for (int i = 0; i < MEASURE; ++i) {
+            uint64_t c1 = rdtsc();
+            volatile auto lvl = logger->level();
+            (void)lvl;
+            uint64_t c2 = rdtsc();
+            samples.push_back(c2 - c1);
+        }
+        auto s = compute_stats(samples);
+        print_row(5, "logger->level() atomic acq", s, ns_per_cycle);
+    }
+
+    // ── 6. atomic_load(shared_ptr, acquire) — 模拟旧 fast_sink_ ──
+    {
+        std::atomic<std::shared_ptr<int>> sp{std::make_shared<int>(42)};
+        auto load_sp = [&]() {
+            volatile auto p = sp.load(std::memory_order_acquire);
+            (void)p;
+        };
+        for (int i = 0; i < WARMUP; ++i) { load_sp(); }
+        samples.clear();
+        for (int i = 0; i < MEASURE; ++i) {
+            uint64_t c1 = rdtsc();
+            load_sp();
+            uint64_t c2 = rdtsc();
+            samples.push_back(c2 - c1);
+        }
+        auto s = compute_stats(samples);
+        print_row(6, "atomic_load(shared_ptr, acq)", s, ns_per_cycle);
+    }
+
+    // ── 7. dynamic_cast<AsyncSinkBase*> 开销 ──────────────────────
     {
         const char* dc_path = "__dc.log";
         std::remove(dc_path);
@@ -202,13 +242,13 @@ int main() {
             samples.push_back(c2 - c1);
         }
         auto s = compute_stats(samples);
-        print_row(5, "dynamic_cast<AsyncSinkBase*>", s, ns_per_cycle);
+        print_row(7, "dynamic_cast<AsyncSinkBase*>", s, ns_per_cycle);
 
         dc_sink->stop();
         std::remove(dc_path);
     }
 
-    // ── 6. compute_encoded_size(int) 开销 ─────────────────────────
+    // ── 8. compute_encoded_size(int) 开销 ─────────────────────────
     {
         for (int i = 0; i < WARMUP; ++i) {
             volatile auto sz = cpp109::detail::compute_encoded_size(42);
@@ -223,10 +263,10 @@ int main() {
             samples.push_back(c2 - c1);
         }
         auto s = compute_stats(samples);
-        print_row(6, "compute_encoded_size(int)", s, ns_per_cycle);
+        print_row(8, "compute_encoded_size(int)", s, ns_per_cycle);
     }
 
-    // ── 7. get_encode_buffer(4) 开销 ──────────────────────────────
+    // ── 9. get_encode_buffer(4) 开销 ──────────────────────────────
     {
         for (int i = 0; i < WARMUP; ++i) {
             volatile auto p = cpp109::detail::get_encode_buffer(4);
@@ -241,10 +281,10 @@ int main() {
             samples.push_back(c2 - c1);
         }
         auto s = compute_stats(samples);
-        print_row(7, "get_encode_buffer(4)", s, ns_per_cycle);
+        print_row(9, "get_encode_buffer(4)", s, ns_per_cycle);
     }
 
-    // ── 8. encode_args(int) 开销 ──────────────────────────────────
+    // ── 10. encode_args(int) 开销 ─────────────────────────────────
     {
         // 预先分配好缓冲区，只测量编码本身
         std::byte* buf = cpp109::detail::get_encode_buffer(64);
@@ -261,10 +301,10 @@ int main() {
             samples.push_back(c2 - c1);
         }
         auto s = compute_stats(samples);
-        print_row(8, "encode_args(int)", s, ns_per_cycle);
+        print_row(10, "encode_args(int)", s, ns_per_cycle);
     }
 
-    // ── 9. spinlock test_and_set + clear (无竞争) ────────────────
+    // ── 11. spinlock test_and_set + clear (无竞争) ────────────────
     {
         std::atomic_flag lock = ATOMIC_FLAG_INIT;
         for (int i = 0; i < WARMUP; ++i) {
@@ -280,14 +320,14 @@ int main() {
             samples.push_back(c2 - c1);
         }
         auto s = compute_stats(samples);
-        print_row(9, "spinlock TAS+clear (no cont)", s, ns_per_cycle);
+        print_row(11, "spinlock TAS+clear (no cont)", s, ns_per_cycle);
     }
 
-    // ── 10. prepare_write(76, fast) — ring buffer 快路径 ─────────
+    // ── 12. prepare_write(76, fast) — ring buffer 快路径 ─────────
     {
         constexpr std::size_t RB_CAP = 1 << 20;   // 1MB 够 fast path
         cpp109::ByteRingBuffer<RB_CAP> rb;
-        constexpr std::size_t REQ = sizeof(cpp109::LogRecordHeader) + 4;  // 76B
+        constexpr std::size_t REQ = 72 + 4;  // 76B（legacy 72B header + 4B args 对照基准）
         for (int i = 0; i < WARMUP; ++i) {
             volatile auto p = rb.prepare_write(REQ);
             (void)p;
@@ -301,29 +341,28 @@ int main() {
             samples.push_back(c2 - c1);
         }
         auto s = compute_stats(samples);
-        print_row(10, "prepare_write(76, fast)", s, ns_per_cycle);
+        print_row(12, "prepare_write(76, fast)", s, ns_per_cycle);
     }
 
-    // ── 11. memcpy 72B (LogRecordHeader) ──────────────────────────
+    // ── 13. memcpy 72B (legacy header 对照基准) ─────────────────────
     {
-        cpp109::LogRecordHeader hdr{};
         alignas(64) char dst[128]{};
-        std::memset(&hdr, 0xAB, sizeof(hdr));
+        std::memset(dst, 0xAB, 72);
         for (int i = 0; i < WARMUP; ++i) {
-            std::memcpy(dst, &hdr, sizeof(cpp109::LogRecordHeader));
+            std::memcpy(dst, dst + 4, 72);
         }
         samples.clear();
         for (int i = 0; i < MEASURE; ++i) {
             uint64_t c1 = rdtsc();
-            std::memcpy(dst, &hdr, sizeof(cpp109::LogRecordHeader));
+            std::memcpy(dst, dst + 4, 72);
             uint64_t c2 = rdtsc();
             samples.push_back(c2 - c1);
         }
         auto s = compute_stats(samples);
-        print_row(11, "memcpy 72B (LogRecordHeader)", s, ns_per_cycle);
+        print_row(13, "memcpy 72B (legacy hdr)", s, ns_per_cycle);
     }
 
-    // ── 12. commit_write(76, release) ─────────────────────────────
+    // ── 14. commit_write(76, release) ─────────────────────────────
     {
         constexpr std::size_t RB_CAP = 1 << 20;
         cpp109::ByteRingBuffer<RB_CAP> rb;
@@ -341,10 +380,10 @@ int main() {
             samples.push_back(c2 - c1);
         }
         auto s = compute_stats(samples);
-        print_row(12, "commit_write(76, release)", s, ns_per_cycle);
+        print_row(14, "commit_write(76, release)", s, ns_per_cycle);
     }
 
-    // ── 13. worker_sleeping_.load(acquire) — 条件检查 ────────────
+    // ── 15. worker_sleeping_.load(acquire) — 条件检查 ────────────
     {
         std::atomic<bool> sleeping{false};
         for (int i = 0; i < WARMUP; ++i) {
@@ -360,15 +399,15 @@ int main() {
             samples.push_back(c2 - c1);
         }
         auto s = compute_stats(samples);
-        print_row(13, "worker_sleeping_.load(acq)", s, ns_per_cycle);
+        print_row(15, "worker_sleeping_.load(acq)", s, ns_per_cycle);
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    // C. 完整路径测量
+    // C. 完整路径测量（真实宏 vs 直接 log_encoded）
     // ═══════════════════════════════════════════════════════════════════
 
-    // ── 14. 完整 async+args: logger->info("m {}", i) ──────────────
-    //     走优化的 log_deferred 路径，包含 level check + source_location + encode + log_encoded
+    // ── 16. 完整 async+args: logger->info("m {}", i) ──────────────
+    //     走宏快路径，包含 level check + source_location + encode + 批量缓冲
     {
         for (int i = 0; i < WARMUP; ++i) {
             logger->info("m {}", i);
@@ -381,10 +420,10 @@ int main() {
             samples.push_back(c2 - c1);
         }
         auto s = compute_stats(samples);
-        print_row(14, "full info(\"m {}\", i)", s, ns_per_cycle);
+        print_row(16, "full info(\"m {}\", i)", s, ns_per_cycle);
     }
 
-    // ── 15. 完整 async no args: logger->info("hello world") ──────
+    // ── 17. 完整 async no args: logger->info("hello world") ──────
     {
         for (int i = 0; i < WARMUP; ++i) {
             (void)i;
@@ -399,10 +438,10 @@ int main() {
             samples.push_back(c2 - c1);
         }
         auto s = compute_stats(samples);
-        print_row(15, "full info(\"hello world\")", s, ns_per_cycle);
+        print_row(17, "full info(\"hello world\")", s, ns_per_cycle);
     }
 
-    // ── 16. 完整 log_encoded 直接调用（有参，绕过宏）────────────
+    // ── 18. log_encoded 直接调用（有参，绕过宏与批量缓冲）────────
     {
         auto* abase = dynamic_cast<cpp109::AsyncSinkBase*>(async_sink.get());
         static const cpp109::TinyMeta _meta_with_args{
@@ -432,10 +471,10 @@ int main() {
             samples.push_back(c2 - c1);
         }
         auto s = compute_stats(samples);
-        print_row(16, "log_encoded direct (w/ args)", s, ns_per_cycle);
+        print_row(18, "log_encoded direct (w/ args)", s, ns_per_cycle);
     }
 
-    // ── 17. 完整 log_encoded 无参直接调用 ────────────────────────
+    // ── 19. log_encoded 直接调用（无参，绕过宏与批量缓冲）────────
     {
         auto* abase = dynamic_cast<cpp109::AsyncSinkBase*>(async_sink.get());
         static const cpp109::TinyMeta _meta_no_args{
@@ -458,7 +497,58 @@ int main() {
             samples.push_back(c2 - c1);
         }
         auto s = compute_stats(samples);
-        print_row(17, "log_encoded direct (no args)", s, ns_per_cycle);
+        print_row(19, "log_encoded direct (no args)", s, ns_per_cycle);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // D. 旧路径/参考环节（已不在热路径，保留作对比基线）
+    // ═══════════════════════════════════════════════════════════════════
+
+    // ── 20. system_clock::now() — 旧时间戳方案开销 ────────────────
+    {
+        for (int i = 0; i < WARMUP; ++i) { volatile auto t = std::chrono::system_clock::now(); (void)t; }
+        samples.clear();
+        for (int i = 0; i < MEASURE; ++i) {
+            uint64_t c1 = rdtsc();
+            volatile auto t = std::chrono::system_clock::now();
+            (void)t;
+            uint64_t c2 = rdtsc();
+            samples.push_back(c2 - c1);
+        }
+        auto s = compute_stats(samples);
+        print_row(20, "system_clock::now()", s, ns_per_cycle);
+    }
+
+    // ── 21. std::format("m {}", i) — 完整格式化（慢路径对比）─────
+    {
+        for (int i = 0; i < WARMUP; ++i) { volatile auto s = std::format("m {}", i); (void)s; }
+        samples.clear();
+        for (int i = 0; i < MEASURE; ++i) {
+            uint64_t c1 = rdtsc();
+            volatile auto s = std::format("m {}", i);
+            (void)s;
+            uint64_t c2 = rdtsc();
+            samples.push_back(c2 - c1);
+        }
+        auto s = compute_stats(samples);
+        print_row(21, "std::format(\"m {}\", i)", s, ns_per_cycle);
+    }
+
+    // ── 22. thread_local vector::data() — get_encode_buffer 内部 ──
+    {
+        static thread_local std::vector<std::byte> tl_vec;
+        if (tl_vec.size() < 128) tl_vec.resize(128);
+        for (int i = 0; i < WARMUP; ++i) { volatile auto p = tl_vec.data(); (void)p; }
+        samples.clear();
+        for (int i = 0; i < MEASURE; ++i) {
+            uint64_t c1 = rdtsc();
+            volatile auto p = tl_vec.data();
+            (void)p;
+            uint64_t c2 = rdtsc();
+            samples.push_back(c2 - c1);
+        }
+        auto s = compute_stats(samples);
+        print_row(22, "thread_local vector::data()", s, ns_per_cycle);
     }
 
     // ═══════════════════════════════════════════════════════════════════

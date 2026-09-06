@@ -275,6 +275,8 @@ CPP109_TEST(default_logger_default_level)
 {
     Capture cap;
     auto logger = cpp109::Registry::instance().default_logger();
+    // 前面的用例把共享 default_logger 的级别改过，这里恢复默认级别（INFO）
+    logger->set_level(cpp109::LogLevel::INFO);
     logger->clear_sinks();
     auto sink = std::make_shared<CapSink>(cap);
     sink->set_level(cpp109::LogLevel::TRACE);

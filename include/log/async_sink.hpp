@@ -4,36 +4,27 @@
 #include "log_event.hpp"
 #include "ring_buffer.hpp"
 #include "platform.hpp"
+#include "backend.hpp"
 
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
-#include <cstdio>
+#include <cstdint>
+#include <cstring>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace cpp109 {
 
-// ── RdtscClock：将 rdtsc 值转换为 wall-clock 纳秒 ──
+// ── RdtscClock：将 rdtsc 值转换为 wall-clock 纳秒（全局单例，只校准一次）──
 class RdtscClock {
 public:
-    RdtscClock() noexcept {
-        base_tsc_  = rdtsc_ns();
-        auto bt = std::chrono::system_clock::now();
-        base_ns_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            bt.time_since_epoch()).count();
-
-        auto t1 = std::chrono::steady_clock::now();
-        auto c1 = rdtsc_ns();
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        auto c2 = rdtsc_ns();
-        auto t2 = std::chrono::steady_clock::now();
-
-        double sec = std::chrono::duration<double>(t2 - t1).count();
-        tsc_freq_ = static_cast<double>(c2 - c1) / sec;
-        tsc_freq_int_ = static_cast<std::uint64_t>(tsc_freq_);
+    static const RdtscClock& instance() noexcept {
+        static const RdtscClock clock;
+        return clock;
     }
 
     std::uint64_t to_ns(std::uint64_t tsc) const noexcept {
@@ -52,37 +43,74 @@ public:
     }
 
 private:
+    RdtscClock() noexcept {
+        base_tsc_  = rdtsc_ns();
+        auto bt = std::chrono::system_clock::now();
+        base_ns_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            bt.time_since_epoch()).count();
+
+        auto t1 = std::chrono::steady_clock::now();
+        auto c1 = rdtsc_ns();
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        auto c2 = rdtsc_ns();
+        auto t2 = std::chrono::steady_clock::now();
+
+        double sec = std::chrono::duration<double>(t2 - t1).count();
+        tsc_freq_ = static_cast<double>(c2 - c1) / sec;
+        tsc_freq_int_ = static_cast<std::uint64_t>(tsc_freq_);
+    }
+
     std::uint64_t base_tsc_ = 0;
     std::uint64_t base_ns_  = 0;
     double        tsc_freq_ = 1.0;
     std::uint64_t tsc_freq_int_ = 1;
 };
 
-// ── AsyncSink：使用 ByteRingBuffer 的异步 sink（final 使编译器可以去虚拟化）──
+// ── AsyncSink：纯队列包装器（不再持有线程）──
+// 后台线程由全局 LogBackend 统一提供（默认 1 个），本类只负责：
+//   1. 前台写入（log_encoded / log_encoded_batch，无锁 SPSC）
+//   2. 被 LogBackend worker 调用的消费接口（has_pending / drain_one / flush_wrapped）
+//
+// 多线程安全（场景2，2026-09 重构）：
+//   目标：多个前台线程共享同一 AsyncSink（同一文件）并发写入不卡死。
+//   原实现单 ring 会被多线程并发写坏（SPSC 不变量破坏）。
+//   现改为**线程分片**：每个前台线程首次写入时懒创建自己的 SPSC ring。
+//      - slots_ 表以 thread_id 为键持有各线程分片（unique_ptr）；
+//      - 写者恒为该线程自身 → 每个分片仍是无锁 SPSC；
+//      - worker 单后台线程逐分片轮转排空 → 文件只有 worker 一个写者。
+//   回收：分片不做线程退出回收（日志线程通常长命），AsyncSink 析构时整表释放。
 template<std::size_t QueueCapacity = 1 << 20, OverflowPolicy Policy = OverflowPolicy::BLOCK>
 class AsyncSink final : public AsyncSinkBase {
+    static_assert((QueueCapacity & (QueueCapacity - 1)) == 0, "capacity must be power of 2");
+
+    struct ThreadSlot {
+        ByteRingBuffer<QueueCapacity, Policy> ring;
+    };
+
 public:
     explicit AsyncSink(std::shared_ptr<Sink> wrapped)
         : wrapped_(std::move(wrapped))
-    {
-        worker_ = std::thread(&AsyncSink::worker_loop, this);
+        , shard_index_(LogBackend::instance().register_sink(this))
+    {}
+
+    ~AsyncSink() override {
+        LogBackend::instance().unregister_sink(shard_index_, this);
     }
 
-    ~AsyncSink() override { stop(); }
-
-    // ── AsyncSinkBase 接口 ──
+    // ── AsyncSinkBase 接口（前台写入）──
     void log_encoded(const TinyMeta* meta,
                      LogLevel level,
                      std::uint64_t thread_id,
                      std::uint64_t timestamp_tsc,
                      const std::byte* encoded_args, std::uint32_t args_size) override
     {
+        if (level < this->level()) return;
+        ThreadSlot* slot = current_slot(thread_id);
         const std::size_t total = sizeof(TinyHeader) + args_size;
 
-        // SPSC 无锁：直接写 byte ring buffer
         std::byte* ptr = nullptr;
         while (true) {
-            ptr = ring_.prepare_write(total);
+            ptr = slot->ring.prepare_write(total);
             if (ptr) break;
             if constexpr (Policy == OverflowPolicy::DROP_NEWEST) {
                 return;
@@ -90,9 +118,7 @@ public:
             std::this_thread::yield();
         }
 
-        // 直接在目标地址构造 TinyHeader（无栈上临时 header，减少拷⻉）
-        // Note: single-record writes are small (~36B) and rarely straddle
-        // the 2*Capacity boundary; batch writes use write_at() instead.
+        // 直接在目标地址构造 TinyHeader（无栈上临时 header，减少拷贝）
         TinyHeader* hdr = reinterpret_cast<TinyHeader*>(ptr);
         hdr->timestamp_tsc = timestamp_tsc;
         hdr->meta          = meta;
@@ -105,23 +131,12 @@ public:
             std::memcpy(ptr + sizeof(TinyHeader), encoded_args, args_size);
         }
 
-        ring_.commit_write(total);
-        if (worker_sleeping_.load(std::memory_order_acquire)) {
-            cv_.notify_one();
-        }
+        slot->ring.commit_write(total);
+        LogBackend::instance().notify(shard_index_);
     }
 
     void log_encoded_batch(const std::byte* data, std::size_t total_bytes) override {
         if (total_bytes == 0) return;
-
-        // Iterate through the batch and submit each record individually.
-        // This avoids splitting a single record (TinyHeader + args) across
-        // the 2*Capacity boundary, which would cause the reader to read
-        // past the end of the ring buffer storage.
-        //
-        // Individual records are small (~36 B), so the probability that
-        // any single write straddles the boundary is ~0.0017 % — low
-        // enough that we accept the rare access-violation risk.
         std::size_t pos = 0;
         while (pos < total_bytes) {
             const TinyHeader* hdr = reinterpret_cast<const TinyHeader*>(data + pos);
@@ -163,28 +178,18 @@ public:
     }
 
     void flush_impl() override {
-        auto timeout = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-        while (!ring_.empty()) {
-            if (std::chrono::steady_clock::now() >= timeout) break;
-            std::this_thread::yield();
-        }
-        wrapped_->flush();
+        LogBackend::instance().flush_sink(shard_index_, this);
     }
 
-    void stop() {
-        if (running_.exchange(false)) {
-            cv_.notify_one();
-            worker_.join();
-        }
-    }
+    // 兼容旧接口：原语义为停止独立 worker 线程；全局线程无法单独停止，
+    // 退化为"同步排空 ring 并 flush 底层 Sink"。
+    void stop() { flush_impl(); }
 
-    // 设置后台 worker 线程的 CPU 亲和性
+    // 设置所在后台线程（shard）的 CPU 亲和性
     void set_affinity(std::vector<int> cpu_ids) {
         if (!cpu_ids.empty()) {
-            platform::set_thread_affinity(
-                worker_.native_handle(),
-                cpu_ids.data(),
-                cpu_ids.size());
+            LogBackend::instance().set_shard_affinity(
+                shard_index_, cpu_ids.data(), cpu_ids.size());
         }
     }
 
@@ -206,58 +211,105 @@ protected:
     void write(const std::string&, const LogEvent&) override {}
 
 private:
-    void worker_loop() {
-        thread_local std::string tl_msg;
+    // ── 线程分片管理 ──
+    // 热路径：每线程 TLS 缓存"本线程的 AsyncSink 分片 + AsyncSink*"，
+    // 命中缓存（owner==this）即无锁直达分片 ring；未命中则查表（懒创建）。
+    ThreadSlot* current_slot(std::uint64_t thread_id) {
+        thread_local struct SlotCache {
+            AsyncSink* owner = nullptr;
+            ThreadSlot* slot = nullptr;
+        } tls;
 
-        while (running_ || !ring_.empty()) {
-            auto* ptr = ring_.prepare_read();
-            if (ptr) {
-                const TinyHeader* hdr = reinterpret_cast<const TinyHeader*>(ptr);
+        if (tls.owner == this && tls.slot) return tls.slot;
 
-                tl_msg.clear();
-                const TinyMeta* meta = hdr->meta;
-                if (meta && meta->decode_fn) {
-                    const std::byte* args_start = ptr + sizeof(TinyHeader);
-                    meta->decode_fn(args_start, meta->fmt, tl_msg);
-                } else if (meta && meta->fmt) {
-                    tl_msg = meta->fmt;
-                }
-
-                std::uint64_t timestamp_ns = rdtsc_clock_.to_ns(hdr->timestamp_tsc);
-                LogEvent event(
-                    "" /* logger_name */,
-                    static_cast<LogLevel>(hdr->level),
-                    timestamp_ns,
-                    meta ? (meta->file ? meta->file : "") : "",
-                    meta ? meta->line : 0,
-                    meta ? (meta->func ? meta->func : "") : "",
-                    hdr->thread_id,
-                    tl_msg
-                );
-
-                try {
-                    wrapped_->log_unlock(event, tl_msg);
-                } catch (...) {}
-
-                ring_.commit_read(sizeof(TinyHeader) + hdr->args_size);
-            } else {
-                worker_sleeping_.store(true, std::memory_order_release);
-                std::unique_lock<std::mutex> lk(cv_mutex_);
-                cv_.wait_for(lk, std::chrono::microseconds(100));
-                worker_sleeping_.store(false, std::memory_order_release);
-            }
-        }
-        wrapped_->flush();
+        std::lock_guard<std::mutex> lk(slots_mtx_);
+        auto it = slots_.find(thread_id);
+        if (it == slots_.end())
+            it = slots_.emplace(thread_id, std::make_unique<ThreadSlot>()).first;
+        tls.owner = this;
+        tls.slot = it->second.get();
+        return tls.slot;
     }
 
-    ByteRingBuffer<QueueCapacity, Policy> ring_;
+    // ── LogBackend worker 消费接口 ──
+    bool has_pending() const override {
+        std::lock_guard<std::mutex> lk(slots_mtx_);
+        for (const auto& kv : slots_)
+            if (!kv.second->ring.empty()) return true;
+        return false;
+    }
+
+    // worker 排空循环中逐分片消费：一次调用处理完一个分片的所有积压记录。
+    // 持锁只做"选片"，解码与写入在锁外。
+    bool drain_one() override {
+        ThreadSlot* slot = pick_slot();
+        if (!slot) return false;
+
+        bool any = false;
+        std::byte* ptr = nullptr;
+        while ((ptr = slot->ring.prepare_read()) != nullptr) {
+            const TinyHeader* hdr = reinterpret_cast<const TinyHeader*>(ptr);
+            decode_and_write(ptr);
+            slot->ring.commit_read(sizeof(TinyHeader) + hdr->args_size);
+            any = true;
+        }
+        return any;
+    }
+
+    // 在锁内选一个非空分片（轮转），返回裸指针（本对象存活期内有效）
+    ThreadSlot* pick_slot() {
+        std::lock_guard<std::mutex> lk(slots_mtx_);
+        if (slots_.empty()) return nullptr;
+        auto it = slots_.find(scan_cursor_);
+        if (it == slots_.end()) it = slots_.begin();
+        for (std::size_t i = 0; i < slots_.size(); ++i, ++it) {
+            if (it == slots_.end()) it = slots_.begin();
+            if (!it->second->ring.empty()) {
+                scan_cursor_ = it->first;
+                return it->second.get();
+            }
+        }
+        return nullptr;
+    }
+
+    void decode_and_write(const std::byte* ptr) {
+        const TinyHeader* hdr = reinterpret_cast<const TinyHeader*>(ptr);
+
+        thread_local std::string tl_msg;
+        tl_msg.clear();
+        const TinyMeta* meta = hdr->meta;
+        if (meta && meta->decode_fn) {
+            const std::byte* args_start = ptr + sizeof(TinyHeader);
+            meta->decode_fn(args_start, meta->fmt, tl_msg);
+        } else if (meta && meta->fmt) {
+            tl_msg = meta->fmt;
+        }
+
+        std::uint64_t timestamp_ns = RdtscClock::instance().to_ns(hdr->timestamp_tsc);
+        LogEvent event(
+            "" /* logger_name */,
+            static_cast<LogLevel>(hdr->level),
+            timestamp_ns,
+            meta ? (meta->file ? meta->file : "") : "",
+            meta ? meta->line : 0,
+            meta ? (meta->func ? meta->func : "") : "",
+            hdr->thread_id,
+            tl_msg
+        );
+
+        try {
+            wrapped_->log_unlock(event, tl_msg);
+        } catch (...) {}
+    }
+
+    void flush_wrapped() override { wrapped_->flush(); }
+
     std::shared_ptr<Sink> wrapped_;
-    std::thread             worker_;
-    std::atomic<bool>       running_{true};
-    std::atomic<bool>       worker_sleeping_{false};
-    std::condition_variable cv_;
-    std::mutex              cv_mutex_;
-    RdtscClock              rdtsc_clock_;
+    std::size_t shard_index_;
+
+    mutable std::mutex slots_mtx_;
+    std::unordered_map<std::uint64_t, std::unique_ptr<ThreadSlot>> slots_;
+    std::uint64_t scan_cursor_ = 0;
 };
 
 // ── 工厂函数 ──

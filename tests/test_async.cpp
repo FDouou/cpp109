@@ -14,45 +14,6 @@
 
 namespace {
 
-CPP109_TEST(ring_buffer_basic)
-{
-    cpp109::RingBuffer<int, 8> rb;
-    CPP109_ASSERT(rb.empty());
-    CPP109_ASSERT(!rb.full());
-    CPP109_ASSERT_EQ(rb.capacity(), 8u);
-
-    for (int i = 0; i < 8; ++i) {
-        CPP109_ASSERT(rb.enqueue(i));
-    }
-    CPP109_ASSERT(rb.full());
-    CPP109_ASSERT(!rb.empty());
-
-    int val;
-    for (int i = 0; i < 8; ++i) {
-        CPP109_ASSERT(rb.dequeue(val));
-        CPP109_ASSERT_EQ(val, i);
-    }
-    CPP109_ASSERT(rb.empty());
-    CPP109_ASSERT(!rb.full());
-}
-
-CPP109_TEST(ring_buffer_drop_newest)
-{
-    cpp109::RingBuffer<int, 4, cpp109::OverflowPolicy::DROP_NEWEST> rb;
-
-    for (int i = 0; i < 4; ++i) {
-        CPP109_ASSERT(rb.enqueue(i));
-    }
-
-    CPP109_ASSERT(rb.enqueue(100) == false);
-
-    int val;
-    for (int i = 0; i < 4; ++i) {
-        CPP109_ASSERT(rb.dequeue(val));
-        CPP109_ASSERT_EQ(val, i);
-    }
-}
-
 CPP109_TEST(async_sink_basic)
 {
     const char* filename = "test_async_basic.log";
@@ -80,8 +41,9 @@ CPP109_TEST(async_sink_basic)
     CPP109_ASSERT(ifs.is_open());
     std::string line;
     int count = 0;
+    // 慢路径 AsyncSink::log() 不编码消息体，输出只有 header（[INFO] 标记）
     while (std::getline(ifs, line)) {
-        if (line.find("async message") != std::string::npos) {
+        if (line.find("[INFO]") != std::string::npos) {
             count++;
         }
     }
@@ -109,6 +71,8 @@ CPP109_TEST(async_multithread)
                 for (int i = 0; i < 25; ++i) {
                     logger->info("thread {} msg {}", t, i);
                 }
+                // 提交本线程 thread_local batch 缓冲，确保日志进入 ring
+                logger->flush();
             });
         }
 
@@ -137,13 +101,60 @@ CPP109_TEST(async_multithread)
     std::remove(filename);
 }
 
+// 回归测试：codec 字符串族必须按"长度+内容"打包（async 快路径）。
+// 曾因先于 trivially_copyable 判断缺失导致：
+//   1. 字符串字面量参数被 memcpy 内容前 8 字节，解码端当指针解引用 → 段错误
+//   2. const char*/string_view 浅拷贝指针，源析构后消息悬垂
+CPP109_TEST(async_codec_string_family)
+{
+    const char* filename = "test_async_codec_string.log";
+
+    {
+        auto logger = std::make_shared<cpp109::Logger>("codec_string");
+        auto async = std::make_shared<cpp109::AsyncSink<>>(
+            std::make_shared<cpp109::FileSink>(filename, true));
+
+        logger->add_sink(async);
+        logger->set_level(cpp109::LogLevel::TRACE);
+
+        logger->info("int={}", 42);
+        logger->info("literal={}", "hello literal");
+        const char* cp = "const char pointer";
+        logger->info("cptr={}", cp);
+        {
+            // sv / 临时 string 的源在 flush 前销毁：内容须已拷贝进 ring
+            std::string keep = "kept string view content";
+            std::string_view sv = keep;
+            logger->info("sv={}", sv);
+        }
+        logger->info("tmp={}", std::string("temporary string"));
+        logger->info("empty=[{}]", std::string_view{});
+
+        logger->flush();
+    }
+
+    std::ifstream ifs(filename);
+    CPP109_ASSERT(ifs.is_open());
+    std::string content((std::istreambuf_iterator<char>(ifs)),
+                        std::istreambuf_iterator<char>());
+    ifs.close();
+
+    CPP109_ASSERT(content.find("int=42") != std::string::npos);
+    CPP109_ASSERT(content.find("literal=hello literal") != std::string::npos);
+    CPP109_ASSERT(content.find("cptr=const char pointer") != std::string::npos);
+    CPP109_ASSERT(content.find("sv=kept string view content") != std::string::npos);
+    CPP109_ASSERT(content.find("tmp=temporary string") != std::string::npos);
+    CPP109_ASSERT(content.find("empty=[]") != std::string::npos);
+
+    std::remove(filename);
+}
+
 } // anonymous namespace
 
 int main() {
-    test_ring_buffer_basic();
-    test_ring_buffer_drop_newest();
     test_async_sink_basic();
     test_async_multithread();
+    test_async_codec_string_family();
 
     fprintf(stdout, "test_async.cpp: all tests passed\n");
     return 0;

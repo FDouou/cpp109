@@ -1,7 +1,7 @@
 ﻿#pragma once
 
 #include "log_level.hpp"
-#include "timestamp.hpp"   // 向后兼容：旧构造函数和 timestamp() 方法需要
+#include "timestamp.hpp"   // 旧构造函数（接收 Timestamp）需要
 
 #include <chrono>
 #include <cstddef>
@@ -47,13 +47,6 @@ inline std::uint64_t rdtsc_ns() noexcept {
 #endif
 }
 
-// ── SourceMeta：每个日志调用点的源位置信息 ──
-struct SourceMeta {
-    const char* file;
-    int         line;
-    const char* func;
-};
-
 // ── TinyMeta：编译期常量打包（每个模板实例化一个 static 实例，在 .data 段）──
 // 后台 worker 通过该指针获取 file/func/fmt/decode_fn，使 header 只需 8B 指针。
 struct TinyMeta {
@@ -65,7 +58,7 @@ struct TinyMeta {
 };
 // total = 40B (static instance, so no per-record cost)
 
-// ── TinyHeader：32B 超轻量 header（对齐 quill，替代 CompactLogHeader 的 60B）──
+// ── TinyHeader：32B 超轻量 header（对齐 quill）──
 struct alignas(8) TinyHeader {
     std::uint64_t      timestamp_tsc;                                      // 8B, offset  0
     const TinyMeta*    meta;                                               // 8B, offset  8
@@ -77,53 +70,32 @@ struct alignas(8) TinyHeader {
 };                                                                         // total 32B
 static_assert(sizeof(TinyHeader) == 32, "TinyHeader must be exactly 32 bytes");
 
-// ── CompactLogHeader：保留向后兼容（旧测试/二进制使用 60B 格式）──
-struct CompactLogHeader {
-    std::uint64_t timestamp_tsc;                                           // 8B, offset  0
-    const char*   fmt;                                                     // 8B, offset  8
-    void (*decode_fn)(const std::byte*, const char*, std::string&);        // 8B, offset 16
-    std::uint64_t thread_id;                                               // 8B, offset 24
-    const char*   file;                                                    // 8B, offset 32
-    const char*   func;                                                    // 8B, offset 40
-    std::uint32_t line;                                                    // 4B, offset 48
-    std::uint32_t args_size;                                               // 4B, offset 52
-    std::uint8_t  level;                                                   // 1B, offset 56
-    std::uint8_t  flags;                                                   // 1B, offset 57
-    std::uint16_t padding;                                                 // 2B, offset 58
-};                                                                         // total 60B
-static_assert(sizeof(CompactLogHeader) <= 64, "CompactLogHeader should be <=64 bytes");
-
-// ── LogRecordHeader：保留向下兼容（旧路径使用）──
-struct LogRecordHeader {
-    std::uint64_t timestamp_tsc;
-    const char*   fmt;
-    const char*   file;
-    const char*   func;
-    const char*   logger_name;
-    void (*decode_fn)(const std::byte*, const char*, std::string&);
-    std::uint64_t thread_id;
-    std::uint32_t line;
-    LogLevel      level;
-    std::uint32_t args_size;
-};
-static_assert(sizeof(LogRecordHeader) <= 72, "LogRecordHeader should be ≤72 bytes");
-
 // ── Codec：参数编解码（类型擦除，编译期生成 decode_fn）──
 namespace detail {
+
+// 字符串族：const char* / char* / char[N] 数组字面量 / std::string / std::string_view。
+// 统一按 "uint32 长度 + 内容" 打包，且【必须】在 trivially_copyable 之前判断：
+// 这些类型本身是 trivial（或经数组退化为指针），若先 memcpy 对象本体，
+// 数组字面量会把字符串内容前 8 字节打包，解码端将其当作指针解引用而崩溃；
+// const char*/string_view 则浅拷贝指针，消息依赖源字符串生命周期而悬垂。
+template<typename T>
+constexpr bool is_string_codec_v =
+    std::is_convertible_v<T, const char*> ||
+    std::is_same_v<std::decay_t<T>, std::string> ||
+    std::is_same_v<std::decay_t<T>, std::string_view>;
 
 // 计算单个参数编码大小
 template<typename T>
 std::size_t encoded_size(const T& arg) {
-    using DT = std::decay_t<T>;
-    if constexpr (std::is_trivially_copyable_v<DT>) {
-        return sizeof(DT);
-    } else if constexpr (std::is_same_v<DT, std::string>) {
-        return sizeof(std::uint32_t) + arg.size();
-    } else if constexpr (std::is_convertible_v<T, const char*>) {
-        const char* s = static_cast<const char*>(arg);
-        return sizeof(std::uint32_t) + std::strlen(s);
-    } else if constexpr (std::is_same_v<DT, std::string_view>) {
-        return sizeof(std::uint32_t) + arg.size();
+    if constexpr (is_string_codec_v<T>) {
+        if constexpr (std::is_convertible_v<T, const char*>) {
+            const char* s = static_cast<const char*>(arg);
+            return sizeof(std::uint32_t) + (s ? std::strlen(s) : 0);
+        } else {
+            return sizeof(std::uint32_t) + arg.size();
+        }
+    } else if constexpr (std::is_trivially_copyable_v<std::decay_t<T>>) {
+        return sizeof(std::decay_t<T>);
     } else {
         static_assert(sizeof(T) == 0, "Unsupported argument type for codec");
         return 0;
@@ -138,32 +110,33 @@ std::size_t compute_encoded_size(const Args&... args) {
     return total;
 }
 
-// 编码单个参数
+// 编码单个参数（编码布局必须与 decode_one 完全一致）
 template<typename T>
 void encode_one(std::byte*& ptr, const T& arg) {
-    using DT = std::decay_t<T>;
-    if constexpr (std::is_trivially_copyable_v<DT>) {
+    if constexpr (is_string_codec_v<T>) {
+        std::uint32_t len;
+        const char* data;
+        if constexpr (std::is_convertible_v<T, const char*>) {
+            data = static_cast<const char*>(arg);
+            len = static_cast<std::uint32_t>(data ? std::strlen(data) : 0);
+        } else {
+            // std::string / std::string_view 均隐式可转 string_view
+            std::string_view sv = arg;
+            data = sv.data();
+            len = static_cast<std::uint32_t>(sv.size());
+        }
+        std::memcpy(ptr, &len, sizeof(len));
+        ptr += sizeof(len);
+        if (len > 0) {
+            std::memcpy(ptr, data, len);
+            ptr += len;
+        }
+    } else if constexpr (std::is_trivially_copyable_v<std::decay_t<T>>) {
+        using DT = std::decay_t<T>;
         std::memcpy(ptr, &arg, sizeof(DT));
         ptr += sizeof(DT);
-    } else if constexpr (std::is_same_v<DT, std::string>) {
-        std::uint32_t len = static_cast<std::uint32_t>(arg.size());
-        std::memcpy(ptr, &len, sizeof(len));
-        ptr += sizeof(len);
-        std::memcpy(ptr, arg.data(), len);
-        ptr += len;
-    } else if constexpr (std::is_convertible_v<T, const char*>) {
-        const char* s = static_cast<const char*>(arg);
-        std::uint32_t len = static_cast<std::uint32_t>(std::strlen(s));
-        std::memcpy(ptr, &len, sizeof(len));
-        ptr += sizeof(len);
-        std::memcpy(ptr, s, len);
-        ptr += len;
-    } else if constexpr (std::is_same_v<DT, std::string_view>) {
-        std::uint32_t len = static_cast<std::uint32_t>(arg.size());
-        std::memcpy(ptr, &len, sizeof(len));
-        ptr += sizeof(len);
-        std::memcpy(ptr, arg.data(), len);
-        ptr += len;
+    } else {
+        static_assert(sizeof(T) == 0, "Unsupported argument type for codec");
     }
 }
 
@@ -175,20 +148,22 @@ void encode_args(std::byte* ptr, const Args&... args) {
 
 // 解码单个参数（后台线程调用）
 template<typename T>
-T decode_one(const std::byte*& ptr) {
+auto decode_one(const std::byte*& ptr) {
     using DT = std::decay_t<T>;
-    if constexpr (std::is_trivially_copyable_v<DT>) {
-        DT val;
-        std::memcpy(&val, ptr, sizeof(DT));
-        ptr += sizeof(DT);
-        return val;
-    } else if constexpr (std::is_same_v<DT, std::string>) {
+    if constexpr (is_string_codec_v<DT>) {
+        // 字符串族统一还原为 std::string：内容已在前台拷贝进 ring，
+        // 解码得到独立、生命周期安全的消息文本（不再持有源指针）。
         std::uint32_t len;
         std::memcpy(&len, ptr, sizeof(len));
         ptr += sizeof(len);
         std::string s(reinterpret_cast<const char*>(ptr), len);
         ptr += len;
         return s;
+    } else if constexpr (std::is_trivially_copyable_v<DT>) {
+        DT val;
+        std::memcpy(&val, ptr, sizeof(DT));
+        ptr += sizeof(DT);
+        return val;
     } else {
         static_assert(sizeof(T) == 0, "Unsupported argument type for codec (decode)");
         return DT{};
@@ -419,13 +394,6 @@ public:
         static thread_local std::string tl_msg;
         format_message(tl_msg);
         return tl_msg;
-    }
-    Timestamp timestamp() const {
-        // 从纳秒正确转换为 system_clock::time_point
-        // system_clock::duration 精度平台相关（MSVC 100ns, Linux 1ns）
-        using namespace std::chrono;
-        auto d = duration_cast<Timestamp::clock::duration>(nanoseconds(timestamp_ns_));
-        return Timestamp(Timestamp::time_point(d));
     }
 
 private:
