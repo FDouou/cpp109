@@ -85,6 +85,11 @@ class AsyncSink final : public AsyncSinkBase {
 
     struct ThreadSlot {
         ByteRingBuffer<QueueCapacity, Policy> ring;
+        // 背压控制：ring 满时 producer 在 cv 上等待（不空转），
+        // worker 消费腾出空间后 notify。仅 BLOCK 策略使用。
+        std::mutex               cv_mtx;
+        std::condition_variable  cv;
+        bool                     waiting = false;   // 受 cv_mtx 保护
     };
 
 public:
@@ -104,51 +109,31 @@ public:
                      std::uint64_t timestamp_tsc,
                      const std::byte* encoded_args, std::uint32_t args_size) override
     {
-        if (level < this->level()) return;
-        ThreadSlot* slot = current_slot(thread_id);
-        const std::size_t total = sizeof(TinyHeader) + args_size;
-
-        std::byte* ptr = nullptr;
-        while (true) {
-            ptr = slot->ring.prepare_write(total);
-            if (ptr) break;
-            if constexpr (Policy == OverflowPolicy::DROP_NEWEST) {
-                return;
-            }
-            std::this_thread::yield();
-        }
-
-        // 直接在目标地址构造 TinyHeader（无栈上临时 header，减少拷贝）
-        TinyHeader* hdr = reinterpret_cast<TinyHeader*>(ptr);
-        hdr->timestamp_tsc = timestamp_tsc;
-        hdr->meta          = meta;
-        hdr->thread_id     = thread_id;
-        hdr->args_size     = args_size;
-        hdr->level         = static_cast<std::uint8_t>(level);
-        hdr->flags         = 0;
-
-        if (args_size > 0 && encoded_args) {
-            std::memcpy(ptr + sizeof(TinyHeader), encoded_args, args_size);
-        }
-
-        slot->ring.commit_write(total);
-        LogBackend::instance().notify(shard_index_);
+        enqueue_record(meta, level, thread_id, timestamp_tsc,
+                       encoded_args, args_size, true /* notify */);
     }
 
     void log_encoded_batch(const std::byte* data, std::size_t total_bytes) override {
         if (total_bytes == 0) return;
+
+        // 批内记录可能来自不同前台线程（flush_all_batches 跨线程提交），
+        // 不能整批写入同一分片——逐条按其 thread_id 归属分片。
+        // 相比单条路径仅省去 sink 级过滤重复判断与 per-record notify（batch 末尾统一一次）。
         std::size_t pos = 0;
-        while (pos < total_bytes) {
+        const std::size_t batch_size = total_bytes;
+        while (pos < batch_size) {
             const TinyHeader* hdr = reinterpret_cast<const TinyHeader*>(data + pos);
-            std::size_t rec_size = sizeof(TinyHeader) + hdr->args_size;
-            log_encoded(hdr->meta,
-                        static_cast<LogLevel>(hdr->level),
-                        hdr->thread_id,
-                        hdr->timestamp_tsc,
-                        data + pos + sizeof(TinyHeader),
-                        hdr->args_size);
+            const std::size_t rec_size = sizeof(TinyHeader) + hdr->args_size;
+            enqueue_record(hdr->meta,
+                           static_cast<LogLevel>(hdr->level),
+                           hdr->thread_id,
+                           hdr->timestamp_tsc,
+                           data + pos + sizeof(TinyHeader),
+                           hdr->args_size,
+                           false /* 延迟 notify */);
             pos += rec_size;
         }
+        LogBackend::instance().notify(shard_index_);
     }
 
     // ── Sink 接口（慢路径：用 thread_local meta 避免悬空指针）──
@@ -211,6 +196,53 @@ protected:
     void write(const std::string&, const LogEvent&) override {}
 
 private:
+    // ── 单条入队（log_encoded 与 batch 共享；do_notify 允许批量合并唤醒）──
+    void enqueue_record(const TinyMeta* meta,
+                        LogLevel level,
+                        std::uint64_t thread_id,
+                        std::uint64_t timestamp_tsc,
+                        const std::byte* encoded_args, std::uint32_t args_size,
+                        bool do_notify)
+    {
+        if (level < this->level()) return;
+        ThreadSlot* slot = current_slot(thread_id);
+        const std::size_t total = sizeof(TinyHeader) + args_size;
+
+        std::byte* ptr = nullptr;
+        if constexpr (Policy == OverflowPolicy::DROP_NEWEST) {
+            ptr = slot->ring.prepare_write(total);
+            if (!ptr) return;   // 满则丢弃（DROP 策略）
+        } else {
+            // BLOCK：ring 满时等待 worker 腾出空间（条件变量，避免 yield 空转）
+            while (true) {
+                ptr = slot->ring.prepare_write(total);
+                if (ptr) break;
+                std::unique_lock<std::mutex> lk(slot->cv_mtx);
+                slot->waiting = true;
+                slot->cv.wait_for(lk, std::chrono::microseconds(100), [&] {
+                    return slot->ring.prepare_write(total) != nullptr;
+                });
+                slot->waiting = false;
+            }
+        }
+
+        // 直接在目标地址构造 TinyHeader（无栈上临时 header，减少拷贝）
+        TinyHeader* hdr = reinterpret_cast<TinyHeader*>(ptr);
+        hdr->timestamp_tsc = timestamp_tsc;
+        hdr->meta          = meta;
+        hdr->thread_id     = thread_id;
+        hdr->args_size     = args_size;
+        hdr->level         = static_cast<std::uint8_t>(level);
+        hdr->flags         = 0;
+
+        if (args_size > 0 && encoded_args) {
+            std::memcpy(ptr + sizeof(TinyHeader), encoded_args, args_size);
+        }
+
+        slot->ring.commit_write(total);
+        if (do_notify) LogBackend::instance().notify(shard_index_);
+    }
+
     // ── 线程分片管理 ──
     // 热路径：每线程 TLS 缓存"本线程的 AsyncSink 分片 + AsyncSink*"，
     // 命中缓存（owner==this）即无锁直达分片 ring；未命中则查表（懒创建）。
@@ -252,6 +284,11 @@ private:
             decode_and_write(ptr);
             slot->ring.commit_read(sizeof(TinyHeader) + hdr->args_size);
             any = true;
+        }
+        // 排空后若生产者正等待空间则唤醒
+        {
+            std::lock_guard<std::mutex> lk(slot->cv_mtx);
+            if (slot->waiting) slot->cv.notify_one();
         }
         return any;
     }
