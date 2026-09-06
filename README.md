@@ -88,7 +88,7 @@ LOG_INFO_FIRST_N(10, "startup phase: {}", step);
 | `RotatingFileSink` | 按大小滚动的文件输出，达到指定大小后自动滚动，可配置保留文件数                 |
 | `DailyFileSink`    | 按时间滚动的文件输出，支持按分钟/小时/天创建新文件，文件名支持时间占位符           |
 | `CallbackSink`     | 自定义回调，每条日志触发回调函数，适用于发送到网络、数据库或第三方监控             |
-| `AsyncSink`        | 异步包装器，将任意 Sink 包装为后台线程写入，通过 SPSC 环形缓冲区解耦 I/O |
+| `AsyncSink`        | 异步包装器，将任意 Sink 包装为后台写入，通过 SPSC 分片队列解耦 I/O |
 
 ### Sink 示例
 
@@ -120,24 +120,27 @@ logger->add_sink(file);
 
 ## 异步日志
 
-cpp109 不依赖全局线程池，而是采用 **per-sink 独立线程模型**——每个 `AsyncSink`
-独占一个后台线程和 SPSC 无锁环形缓冲区（RingBuffer），生产者写入无竞争。
+cpp109 的异步层采用 **全局后台 worker + 前台线程分片** 模型：
+
+- 所有 `AsyncSink` 共享进程级 `LogBackend` 的固定数量 worker（默认 1 个），避免 sink 数量增长导致线程膨胀；
+- 每个前台线程首次写某 sink 时懒创建自己的 SPSC 分片队列，写者恒为该线程本身 → 入队无锁、多线程共享同一 sink（同一文件）安全；
+- 后台 worker 遍历各 sink 的所有线程分片，聚合解码后写入底层 Sink（文件只有一个写者）；
+- 队列满时生产者通过条件变量等待（不空转），worker 腾出空间后唤醒。
 
 ```
-生产者线程                          AsyncSink                       文件
+前台线程                          AsyncSink（分片队列池）                后台
 ────────────────────────────────────────────────────────────────────────
-worker_1 ───→ RingBuffer_1 ───→ bg_thread_1 ───→ file_1.log
-worker_2 ───→ RingBuffer_2 ───→ bg_thread_2 ───→ file_2.log
-worker_3 ───→ RingBuffer_3 ───→ bg_thread_3 ───→ file_3.log
-   ...
-worker_N ───→ RingBuffer_N ───→ bg_thread_N ───→ file_N.log
+thread_1 ───→ ┌─ slot(t1) ─┐
+thread_2 ───→ ├─ slot(t2) ─┼──→ LogBackend worker ───→ file.log
+thread_3 ───→ └─ slot(t3) ─┘
 ```
 
 设计：
 
-- **SPSC 环形缓冲区入队**：入队仅两次原子操作（写位置预留 + 提交），无需 CAS 重试
-- **条件变量通知**：数据到达后通知 consumer 线程，空闲时线程休眠
-- **格式化分工**：消息体的 `std::format` 在后台 consumer 线程完成，前台生产者线程只做二进制编码
+- **SPSC 分片入队**：每线程独立分片，入队仅两次原子操作（写位置预留 + 提交），无需锁与 CAS 重试
+- **线程分片**：同一 AsyncSink 可被多线程共享（写同一文件），各线程互不阻塞
+- **条件变量背压**：分片满时生产者休眠等待，worker 排空后唤醒，避免自旋烧 CPU
+- **格式化分工**：消息体 `std::format` 在后台 worker 完成，前台只做二进制编码 + 批量缓冲（4KB thread_local）
 
 ### 构造方式
 
@@ -148,19 +151,26 @@ auto async_console = cpp109::make_async_sink<cpp109::ConsoleSink>();
 // 方式 2：包装已有的 Sink
 auto file = std::make_shared<cpp109::FileSink>("app.log");
 auto async_file = std::make_shared<cpp109::AsyncSink<>>(file);
+
+logger->add_sink(async_file);
 ```
 
-### 多线程使用示例
+> `AsyncSink` 的模板参数（队列容量/溢出策略）仅为源码兼容保留：
+> 队列已下沉到前台线程分片（统一 1MB / BLOCK），由全局 LogBackend worker 消费。
+
+### 多线程使用示例（同一 logger / 同一文件）
 
 ```cpp
-// 每个线程绑定独立的 AsyncSink + 文件，互不阻塞
-for (int i = 0; i < 8; ++i) {
-    auto sink = cpp109::make_async_sink<cpp109::FileSink>(
-        "thread_" + std::to_string(i) + ".log", true);
-    auto logger = cpp109::get_logger("worker_" + std::to_string(i));
-    logger->add_sink(sink);
-}
+// 所有线程共享同一 logger + AsyncSink（写同一文件）——线程分片保证安全
+auto logger = cpp109::get_logger("app");
+logger->add_sink(cpp109::make_async_sink<cpp109::FileSink>("app.log"));
+
+// 任意数量的线程可并发调用
+std::thread t1([&]{ for (...) logger->info("from thread 1: {}", i); });
+std::thread t2([&]{ for (...) logger->info("from thread 2: {}", i); });
 ```
+
+每线程一个分片队列，线程间互不阻塞；后台单 worker 聚合后串行落盘，文件内无交叉写。
 
 ## Logger 层级
 
@@ -233,9 +243,7 @@ cfg.add_sink("file")
    .set_property("filename", "logs/app.log")
    .set_property("max_size_mb", "10")
    .set_property("max_files", "5")
-    .set_async()                                   // 默认容量 1MB，overflow_policy=block
-    .set_queue_size(1 << 20)                       // 可选：自定义队列容量（字节）
-    .set_overflow_policy("block");
+    .set_async();    // 包装为 AsyncSink（分片队列容量/策略为全局统一配置）
 ```
 
 ## 构建
@@ -253,26 +261,29 @@ ctest --test-dir build
 
 ## 性能
 
-### 入队延迟（async + FileSink）
+> 数字为开发机实测（i9-12900HX / MSVC /O2 / Release，2.5GHz），仅作参考。
 
-| 场景            | P50      | P99       |
-|----------------|----------|-----------|
-| async + args   | ~18 ns   | ~104 ns   |
-| async no args  | ~16 ns   | ~78 ns    |
+### 入队延迟（async + NullSink，纯入队路径）
+
+| 场景             | P50      | P99      |
+|-----------------|----------|----------|
+| async + args    | ~18.8 ns | ~55 ns   |
+| async no args   | ~17 ns   | ~55 ns   |
 
 - 测量方式：rdtsc，200K 预热 + 2M 测量
-- 编译器：MSVC /O2
-- CPU：i9 12900HX
+- 队列满时背压用条件变量等待（不空转），P99 长尾主要来自批 flush 与 OS 调度
 
-### 多线程吞吐（async + FileSink，per-thread 独立文件）
+### 多线程并发（同一 logger / 同一 AsyncSink / NullSink）
 
-| 线程数 | 总吞吐量             |
-|-------|---------------------|
-| 1t    | ~5,000,000 msg/s    |
-| 4t    | ~16,000,000 msg/s   |
-| 8t    | ~21,900,000 msg/s   |
-| 16t   | ~32,400,000 msg/s   |
+| 线程数 | P50（merged） | P99（merged） |
+|--------|--------------|--------------|
+| 1      | ~19 ns       | ~55 ns       |
+| 2      | ~19 ns       | ~70 ns       |
+| 4      | ~19 ns       | ~140 ns      |
+| 8      | ~19 ns       | ~205 ns      |
 
-- 测量方式：1s 预热 + 2s 测量
-- 编译器：MSVC /O2
-- 纯日志无模拟工作负载
+线程分片保证各线程入队互不阻塞；P99 随线程数上升来自后台单 worker 聚合消费与 OS 调度抖动。
+
+### 多线程落盘（async + FileSink，8 线程共享同一文件）
+
+后台单 worker 串行写文件，端到端吞吐受磁盘与格式化限制（数 M msg/s 量级），线程间无锁竞争、无死锁。
