@@ -32,6 +32,7 @@ bench/benchmark.txt
 bench/bench.txt
 bench/bench_*.txt
 bench/bench_spdlog.cpp
+bench/results/
 
 # 本地保留、不提交的对照基准
 bench/bench_latency_quill_mt.cpp
