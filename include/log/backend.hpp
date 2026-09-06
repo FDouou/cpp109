@@ -63,6 +63,7 @@ private:
         std::condition_variable  cv;
         std::vector<AsyncSinkBase*> sinks;
         std::thread              worker;
+        std::atomic<bool>        sleeping{false};  // worker 是否在 cv 上等待
     };
 
     void ensure_started();
@@ -120,11 +121,18 @@ inline void LogBackend::unregister_sink(std::size_t shard_index, AsyncSinkBase* 
 }
 
 inline void LogBackend::notify(std::size_t shard_index) {
-    wake_shard(shards_[shard_index]);
+    auto& shard = shards_[shard_index];
+    // 热路径：仅当 worker 确实在睡眠等待时才触发唤醒，避免每次 notify
+    // 都与 worker 争抢 mutex（P99 长尾的主因）
+    if (shard.sleeping.load(std::memory_order_acquire)) {
+        shard.cv.notify_one();
+    }
 }
 
 inline void LogBackend::wake_shard(Shard& shard) {
-    shard.cv.notify_one();
+    if (shard.sleeping.load(std::memory_order_acquire)) {
+        shard.cv.notify_one();
+    }
 }
 
 inline void LogBackend::flush_sink(std::size_t shard_index, AsyncSinkBase* sink) {
@@ -163,6 +171,8 @@ inline void LogBackend::shard_worker(Shard* shard) {
         }
         if (!running_.load(std::memory_order_acquire) && !has_data) break;
         if (!progress) {
+            // 进入睡眠前置位 sleeping；notify() 据此判断是否需要唤醒
+            shard->sleeping.store(true, std::memory_order_release);
             std::unique_lock<std::mutex> lk(shard->mtx);
             shard->cv.wait_for(lk, std::chrono::microseconds(50), [&] {
                 if (!running_.load(std::memory_order_acquire)) return true;
@@ -170,6 +180,7 @@ inline void LogBackend::shard_worker(Shard* shard) {
                     if (sink->has_pending()) return true;
                 return false;
             });
+            shard->sleeping.store(false, std::memory_order_release);
         }
     }
     // 退出前 flush 所有底层 Sink
