@@ -12,8 +12,8 @@ int main() {
     // 修改全局格式
     cpp109::Registry::instance().set_pattern("[%H:%M:%S] [%l] [%n] %v");
 
-    logger->info("custom format test");
-    logger->warn("another test");
+    LOG_INFO_TO(logger, "custom format test");
+    LOG_WARN_TO(logger, "another test");
 
     // 也可以为单个 Sink 设置独立格式
     auto custom_formatter = std::make_unique<cpp109::Formatter>("%v  ←  at %g:%#");
@@ -21,7 +21,7 @@ int main() {
     console->set_formatter(std::move(custom_formatter));
     logger->add_sink(console);
 
-    logger->info("this has a special format");
+    LOG_INFO_TO(logger, "this has a special format");
 
     return 0;
 }

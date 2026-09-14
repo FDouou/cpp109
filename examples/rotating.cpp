@@ -9,7 +9,7 @@ int main() {
     logger->add_sink(rotating);
 
     for (int i = 0; i < 100000; ++i) {
-        logger->info("line {}: this is a very long message to fill up the file quickly", i);
+        LOG_INFO_TO(logger, "line {}: this is a very long message to fill up the file quickly", i);
     }
 
     logger->flush();

@@ -69,7 +69,7 @@ CPP109_TEST(async_multithread)
         for (int t = 0; t < 4; ++t) {
             threads.emplace_back([logger, t]() {
                 for (int i = 0; i < 25; ++i) {
-                    logger->info("thread {} msg {}", t, i);
+                    LOG_INFO_TO(logger, "thread {} msg {}", t, i);
                 }
                 // 提交本线程 thread_local batch 缓冲，确保日志进入 ring
                 logger->flush();
@@ -117,18 +117,18 @@ CPP109_TEST(async_codec_string_family)
         logger->add_sink(async);
         logger->set_level(cpp109::LogLevel::TRACE);
 
-        logger->info("int={}", 42);
-        logger->info("literal={}", "hello literal");
+        LOG_INFO_TO(logger, "int={}", 42);
+        LOG_INFO_TO(logger, "literal={}", "hello literal");
         const char* cp = "const char pointer";
-        logger->info("cptr={}", cp);
+        LOG_INFO_TO(logger, "cptr={}", cp);
         {
             // sv / 临时 string 的源在 flush 前销毁：内容须已拷贝进 ring
             std::string keep = "kept string view content";
             std::string_view sv = keep;
-            logger->info("sv={}", sv);
+            LOG_INFO_TO(logger, "sv={}", sv);
         }
-        logger->info("tmp={}", std::string("temporary string"));
-        logger->info("empty=[{}]", std::string_view{});
+        LOG_INFO_TO(logger, "tmp={}", std::string("temporary string"));
+        LOG_INFO_TO(logger, "empty=[{}]", std::string_view{});
 
         logger->flush();
     }

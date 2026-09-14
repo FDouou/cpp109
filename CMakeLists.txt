@@ -112,6 +112,10 @@ add_executable(test_macros tests/test_macros.cpp)
 target_link_libraries(test_macros 109cpp)
 add_test(NAME test_macros COMMAND test_macros)
 
+add_executable(test_callsite tests/test_callsite.cpp)
+target_link_libraries(test_callsite 109cpp)
+add_test(NAME test_callsite COMMAND test_callsite)
+
 # ── 性能基准（手动运行，不加入 ctest）────────────────────────────
 # 注：吞吐量基准（bench.cpp、bench_thru_*、bench_comparison 等）与重复的
 #     bench_latency_breakdown 已删除，只保留入队延迟相关的基准。

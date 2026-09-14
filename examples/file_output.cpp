@@ -9,7 +9,7 @@ int main() {
     logger->add_sink(file_sink);
 
     for (int i = 0; i < 10; ++i) {
-        logger->info("line {}", i);
+        LOG_INFO_TO(logger, "line {}", i);
     }
 
     logger->flush();

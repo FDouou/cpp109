@@ -103,7 +103,8 @@ public:
 
     // 类型擦除的编码入队接口，由 AsyncSink 模板特化实现
     // 前台线程已编码好 args，后台 worker 通过 meta->decode_fn 解码并格式化
-    // meta 指向 static const TinyMeta 实例（生命周期永久），包含 file/func/fmt/decode_fn
+    // meta 指向持久 TinyMeta（宏路径为调用点 static，直接 API 为调用点表条目），
+    // 包含 file/line/func/fmt/decode_fn
     virtual void log_encoded(const TinyMeta* meta,
                              LogLevel level,
                              std::uint64_t thread_id,

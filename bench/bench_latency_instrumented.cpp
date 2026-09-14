@@ -1,7 +1,7 @@
 // bench_latency_instrumented.cpp — 插桩延迟基准（分段剖析异步入队路径）
 //
 // 本文件由 bench_latency_instrumented.cpp 与 bench_latency_breakdown.cpp 合并而来：
-//   - 保留 instrumented 的 A/B/C 三段式结构，含真实 logger->info() 宏路径
+//   - 保留 instrumented 的 A/B/C 三段式结构，含真实 LOG_INFO_TO(logger, ) 宏路径
 //   - 并入 breakdown 独有的参考/旧路径环节（level()、atomic_load(shared_ptr)、
 //     system_clock::now、std::format、thread_local vector::data 等）
 //   - 样本量取 breakdown 的大样本（200K 预热 + 2M 测量）
@@ -406,16 +406,16 @@ int main() {
     // C. 完整路径测量（真实宏 vs 直接 log_encoded）
     // ═══════════════════════════════════════════════════════════════════
 
-    // ── 16. 完整 async+args: logger->info("m {}", i) ──────────────
+    // ── 16. 完整 async+args: LOG_INFO_TO(logger, "m {}", i) ──────────────
     //     走宏快路径，包含 level check + source_location + encode + 批量缓冲
     {
         for (int i = 0; i < WARMUP; ++i) {
-            logger->info("m {}", i);
+            LOG_INFO_TO(logger, "m {}", i);
         }
         samples.clear();
         for (int i = 0; i < MEASURE; ++i) {
             uint64_t c1 = rdtsc();
-            logger->info("m {}", i);
+            LOG_INFO_TO(logger, "m {}", i);
             uint64_t c2 = rdtsc();
             samples.push_back(c2 - c1);
         }
@@ -423,17 +423,17 @@ int main() {
         print_row(16, "full info(\"m {}\", i)", s, ns_per_cycle);
     }
 
-    // ── 17. 完整 async no args: logger->info("hello world") ──────
+    // ── 17. 完整 async no args: LOG_INFO_TO(logger, "hello world") ──────
     {
         for (int i = 0; i < WARMUP; ++i) {
             (void)i;
-            logger->info("hello world");
+            LOG_INFO_TO(logger, "hello world");
         }
         samples.clear();
         for (int i = 0; i < MEASURE; ++i) {
             (void)i;
             uint64_t c1 = rdtsc();
-            logger->info("hello world");
+            LOG_INFO_TO(logger, "hello world");
             uint64_t c2 = rdtsc();
             samples.push_back(c2 - c1);
         }

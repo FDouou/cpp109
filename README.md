@@ -39,6 +39,9 @@ g++ -std=c++20 -I./include main.cpp
 
 ### 基础用法
 
+日志**写入统一使用宏**（唯一入口，保证每个调用点零查找、编译期元数据），
+logger / sink 的创建与配置使用 API：
+
 ```cpp
 #include "log/log.hpp"
 
@@ -46,24 +49,34 @@ int main() {
     auto logger = cpp109::get_logger("app");
     logger->add_sink(std::make_shared<cpp109::ConsoleSink>());
 
-    logger->info("hello {}", "world");
-    logger->warn("something might be wrong, code={}", 500);
-    logger->error("something went wrong");
+    LOG_INFO_TO(logger, "hello {}", "world");
+    LOG_WARN_TO(logger, "something might be wrong, code={}", 500);
+    LOG_ERROR_TO(logger, "something went wrong");
+
+    // 默认 logger：配置一次后即可使用不带 _TO 的宏
+    auto d = cpp109::Registry::instance().default_logger();
+    d->add_sink(std::make_shared<cpp109::FileSink>("app.log"));
+    LOG_INFO("hello {}", "world");
 }
 ```
 
 ### 便捷宏
 
-针对默认 logger 提供一组宏，无需手动调用 `get_logger`：
+`LOG_<LEVEL>(fmt, ...)` 写入默认 logger，`LOG_<LEVEL>_TO(logger, fmt, ...)`
+写入指定 logger：
 
 ```cpp
-// 基本级别宏
+// 默认 logger
 LOG_TRACE("trace level message");
 LOG_DEBUG("debug value = {}", x);
 LOG_INFO("hello {}", "world");
 LOG_WARN("something might be wrong, code={}", 500);
 LOG_ERROR("something went wrong");
 LOG_FATAL("fatal error, aborting...");  // 触发 std::abort()
+
+// 指定 logger（logger 可为 shared_ptr 或裸指针）
+LOG_INFO_TO(logger, "hello {}", "world");
+LOG_ERROR_TO(logger, "code={}", ret);
 
 // 条件宏：condition 为 true 时才输出
 LOG_INFO_IF(x > 100, "x is large: {}", x);
@@ -76,8 +89,6 @@ LOG_INFO_EVERY_N(100, "progress: {} items processed", count);
 // 前 N 次宏：仅前 N 次调用输出
 LOG_INFO_FIRST_N(10, "startup phase: {}", step);
 ```
-
-> 这些宏最终调用 `cpp109::Registry::instance().default_logger()`，默认级别为 INFO，首次调用时自动附加 `ConsoleSink`。
 
 ## Sink 列表
 
@@ -205,29 +216,24 @@ ctest --test-dir build
 
 ## 性能
 
-> 数字为开发机实测（i9-12900HX / MSVC /O2 / Release，2.5GHz）
+> （i9-12900HX / MSVC /O2 / Release，2.5GHz，宏写入路径）
 
 ### 入队延迟
 
 | 场景             | P50     | P99     |
 |-----------------|---------|---------|
-| async + args    | ~18.4 ns | ~78 ns  |
-| async no args   | ~16.8 ns | ~54 ns  |
+| async + args    | ~18.4 ns | ~54 ns  |
+| async no args   | ~16.0 ns | ~52 ns  |
 
-- 测量方式：rdtsc，200K 预热 + 2M 测量
+- 测量方式：rdtsc，200K 预热 + 2M 测量（`LOG_INFO_TO`，单调用点循环）
 
 ### 多线程并发入队
 
 | 线程数 | P50（merged） | P99（merged） |
 |--------|--------------|--------------|
-| 1      | ~18.8 ns     | ~54 ns       |
-| 2      | ~18.8 ns     | ~101 ns      |
-| 4      | ~18.4 ns     | ~116 ns      |
-| 8      | ~18.8 ns     | ~149 ns      |
+| 1      | ~16.8 ns     | ~52 ns       |
+| 2      | ~17.2 ns     | ~62 ns       |
+| 4      | ~18.8 ns     | ~150 ns      |
+| 8      | ~18.8 ns     | ~160 ns      |
 
 - 测量方式：多线程共享同一 logger + AsyncSink，barrier 同步后 rdtsc 计时，每线程 100K 样本
-
-### 多线程落盘
-
-- async + FileSink，8 线程共享同一文件，端到端吞吐数 M msg/s 量级
-- 2/4/8 线程各 2-5 万条并发写同一文件实测通过，无死锁、无丢行

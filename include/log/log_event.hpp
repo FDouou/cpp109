@@ -3,16 +3,21 @@
 #include "log_level.hpp"
 #include "timestamp.hpp"   // 旧构造函数（接收 Timestamp）需要
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <format>
+#include <functional>
+#include <memory>
+#include <mutex>
 #include <new>
 #include <string>
 #include <string_view>
 #include <tuple>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -47,16 +52,29 @@ inline std::uint64_t rdtsc_ns() noexcept {
 #endif
 }
 
-// ── TinyMeta：编译期常量打包（每个模板实例化一个 static 实例，在 .data 段）──
-// 后台 worker 通过该指针获取 file/func/fmt/decode_fn，使 header 只需 8B 指针。
+// ── TinyMeta：每个日志调用点一份的持久元数据 ──
+// 宏路径（LOG_* / LOG_*_TO）在用户文件生成 static 实例（地址为编译期常量）；
+// LogEvent 慢路径经 find_or_create_callsite 按 (file,line,fmt) 缓存到
+// 全局表。后台 worker 通过记录中的指针读取，使 TinyHeader 只需 8B 指针。
+using DecodeFn = void (*)(const std::byte*, const char*, std::string&);
+
 struct TinyMeta {
-    const char* file;                                                      // 8B
-    int         line;                                                      // 4B (+4B padding)
-    const char* func;                                                      // 8B
-    const char* fmt;                                                       // 8B
-    void (*decode_fn)(const std::byte*, const char*, std::string&);        // 8B
+    const char* file;                                    // 8B
+    int         line;                                    // 4B (+4B padding)
+    const char* func;                                    // 8B
+    const char* fmt;                                     // 8B
+    // decode_fn 只依赖参数类型组合，每个调用点恒定；但宏展开处无法得知
+    // 类型，故首次调用时由 log_at 惰性写入（atomic 保证多线程安全）。
+    mutable std::atomic<DecodeFn> decode_fn;             // 8B
+
+    constexpr TinyMeta(const char* f, int l, const char* fn, const char* fm,
+                       DecodeFn df = nullptr) noexcept
+        : file(f), line(l), func(fn), fmt(fm), decode_fn(df) {}
+
+    TinyMeta(const TinyMeta&) = delete;
+    TinyMeta& operator=(const TinyMeta&) = delete;
 };
-// total = 40B (static instance, so no per-record cost)
+// total = 40B (per call site, not per record)
 
 // ── TinyHeader：32B 超轻量 header（对齐 quill）──
 struct alignas(8) TinyHeader {
@@ -72,6 +90,68 @@ static_assert(sizeof(TinyHeader) == 32, "TinyHeader must be exactly 32 bytes");
 
 // ── Codec：参数编解码（类型擦除，编译期生成 decode_fn）──
 namespace detail {
+
+// ── 调用点表：LogEvent 慢路径的来源位置 → 持久 TinyMeta ──
+// 热路径靠 TLS 4 槽缓存（同一来源连续出现时首槽命中）；
+// 未命中时全局表按 (file,line,fmt) 去重插入，条目生命周期与进程相同。
+struct CallSiteKey {
+    const char* file;
+    int         line;
+    const char* fmt;
+
+    bool operator==(const CallSiteKey& o) const noexcept {
+        return file == o.file && line == o.line && fmt == o.fmt;
+    }
+};
+struct CallSiteKeyHash {
+    std::size_t operator()(const CallSiteKey& k) const noexcept {
+        std::size_t h = std::hash<const void*>{}(k.file);
+        h ^= std::hash<int>{}(k.line) + 0x9e3779b9u + (h << 6) + (h >> 2);
+        h ^= std::hash<const void*>{}(k.fmt) + 0x9e3779b9u + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+inline TinyMeta* find_or_create_callsite(const char* file, int line,
+                                         const char* func, const char* fmt) {
+    struct Entry {
+        const char* file;
+        int         line;
+        const char* fmt;
+        TinyMeta*   cs;
+    };
+    thread_local static Entry    cache[4]{};
+    thread_local static unsigned cursor = 0;
+
+    // 热路径：先查最近使用的槽位（同一来源连续出现时命中率极高）
+    const unsigned last = cursor;
+    if (cache[last].cs && cache[last].file == file &&
+        cache[last].line == line && cache[last].fmt == fmt) {
+        return cache[last].cs;
+    }
+
+    for (unsigned i = 0; i < 4; ++i) {
+        const Entry& e = cache[i];
+        if (e.cs && e.file == file && e.line == line && e.fmt == fmt) {
+            cache[last] = e;   // 提升为最近使用
+            return e.cs;
+        }
+    }
+
+    static std::mutex table_mtx;
+    static std::unordered_map<CallSiteKey, std::unique_ptr<TinyMeta>, CallSiteKeyHash> table;
+
+    std::lock_guard<std::mutex> lk(table_mtx);
+    auto& slot = table[CallSiteKey{file, line, fmt}];
+    if (!slot) {
+        slot = std::make_unique<TinyMeta>(file, line, func, fmt);
+    }
+    TinyMeta* cs = slot.get();
+
+    cursor = (cursor + 1) & 3u;
+    cache[cursor] = Entry{file, line, fmt, cs};
+    return cs;
+}
 
 // 字符串族：const char* / char* / char[N] 数组字面量 / std::string / std::string_view。
 // 统一按 "uint32 长度 + 内容" 打包，且【必须】在 trivially_copyable 之前判断：

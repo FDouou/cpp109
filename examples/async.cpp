@@ -25,11 +25,11 @@ int main() {
 
     std::thread t1([&]() {
         for (int i = 0; i < 5000; ++i)
-            logger->info("thread1: line {}", i);
+            LOG_INFO_TO(logger, "thread1: line {}", i);
     });
     std::thread t2([&]() {
         for (int i = 0; i < 5000; ++i)
-            logger->info("thread2: line {}", i);
+            LOG_INFO_TO(logger, "thread2: line {}", i);
     });
 
     t1.join();

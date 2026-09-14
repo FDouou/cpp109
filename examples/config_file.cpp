@@ -18,13 +18,13 @@ int main() {
 
     // ── 之后正常使用 ──────────────────────────────────
     auto admin = cpp109::get_logger("admin");
-    admin->info("管理后台启动");
+    LOG_INFO_TO(admin, "管理后台启动");
 
     auto goods = cpp109::get_logger("goods.import");  // 前缀回退命中 goods 配置
-    goods->debug("商品导入开始, count={}", 500);
+    LOG_DEBUG_TO(goods, "商品导入开始, count={}", 500);
 
     auto unknown = cpp109::get_logger("something_else"); // 无匹配，走 root
-    unknown->info("这条走 root");
+    LOG_INFO_TO(unknown, "这条走 root");
 
     return 0;
 }

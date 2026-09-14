@@ -136,29 +136,20 @@ public:
         LogBackend::instance().notify(shard_index_);
     }
 
-    // ── Sink 接口（慢路径：用 thread_local meta 避免悬空指针）──
+    // ── Sink 接口（慢路径：按来源位置查持久调用点条目）──
     void log(const LogEvent& event) override {
         if (event.level() < this->level()) return;
-        // thread_local 持久存储，确保 worker 异步读取时指针仍然有效
-        thread_local static TinyMeta tl_meta{};
-        tl_meta.file = event.file().data();
-        tl_meta.line = static_cast<int>(event.line());
-        tl_meta.func = event.func().data();
-        tl_meta.fmt  = nullptr;
-        tl_meta.decode_fn = nullptr;
-        log_encoded(&tl_meta, event.level(), event.thread_id(),
+        TinyMeta* cs = detail::find_or_create_callsite(
+            event.file().data(), event.line(), event.func().data(), nullptr);
+        log_encoded(cs, event.level(), event.thread_id(),
                     rdtsc_ns(), nullptr, 0);
     }
 
     void log_move(LogEvent&& event) override {
         if (event.level() < this->level()) return;
-        thread_local static TinyMeta tl_meta{};
-        tl_meta.file = event.file().data();
-        tl_meta.line = static_cast<int>(event.line());
-        tl_meta.func = event.func().data();
-        tl_meta.fmt  = nullptr;
-        tl_meta.decode_fn = nullptr;
-        log_encoded(&tl_meta, event.level(), event.thread_id(),
+        TinyMeta* cs = detail::find_or_create_callsite(
+            event.file().data(), event.line(), event.func().data(), nullptr);
+        log_encoded(cs, event.level(), event.thread_id(),
                     rdtsc_ns(), nullptr, 0);
     }
 
@@ -315,11 +306,14 @@ private:
         thread_local std::string tl_msg;
         tl_msg.clear();
         const TinyMeta* meta = hdr->meta;
-        if (meta && meta->decode_fn) {
-            const std::byte* args_start = ptr + sizeof(TinyHeader);
-            meta->decode_fn(args_start, meta->fmt, tl_msg);
-        } else if (meta && meta->fmt) {
-            tl_msg = meta->fmt;
+        if (meta) {
+            DecodeFn fn = meta->decode_fn.load(std::memory_order_relaxed);
+            if (fn) {
+                const std::byte* args_start = ptr + sizeof(TinyHeader);
+                fn(args_start, meta->fmt, tl_msg);
+            } else if (meta->fmt) {
+                tl_msg = meta->fmt;
+            }
         }
 
         std::uint64_t timestamp_ns = RdtscClock::instance().to_ns(hdr->timestamp_tsc);

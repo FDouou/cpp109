@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <algorithm>
+#include <cstdio>
 #include <format>
 #include <source_location>
 #include <memory>
@@ -19,7 +20,11 @@ namespace cpp109 {
 // Batch buffer for foreground thread: accumulate multiple records and submit
 // as one batch to reduce atomic RMW on the ring buffer.
 namespace detail {
-    static constexpr std::size_t BATCH_CAPACITY = 4096;
+    // 前台线程批量缓冲容量；可用 CPP109_BATCH_CAPACITY 覆盖（基准实验用）
+#ifndef CPP109_BATCH_CAPACITY
+#define CPP109_BATCH_CAPACITY 4096
+#endif
+    static constexpr std::size_t BATCH_CAPACITY = CPP109_BATCH_CAPACITY;
 
     struct BatchBuffer;
 
@@ -79,27 +84,17 @@ class Logger : public std::enable_shared_from_this<Logger> {
 public:
     explicit Logger(std::string name) : name_(std::move(name)){}
 
+    // 唯一写入入口，由 LOG_* / LOG_*_TO 宏在调用点生成 static TinyMeta 后调用。
+    // 直接调用会被编译期格式串校验通过，但 file/line/func 需要调用方自备。
     template<typename... Args>
-    void trace(std::format_string<Args...> fmt, Args&&... args);
-
-    template<typename... Args>
-    void debug(std::format_string<Args...> fmt, Args&&... args);
-
-    template<typename... Args>
-    void info(std::format_string<Args...> fmt, Args&&... args);
-
-    template<typename... Args>
-    void warn(std::format_string<Args...> fmt, Args&&... args);
-
-    template<typename... Args>
-    void error(std::format_string<Args...> fmt, Args&&... args);
-
-    template<typename... Args>
-    void fatal(std::format_string<Args...> fmt, Args&&... args);
+    void log_at(LogLevel level, TinyMeta* cs,
+                std::format_string<Args...> fmt, Args&&... args);
 
     void log(LogLevel level, std::string formatted_msg,
              std::source_location loc){
-                log_impl(level, std::move(formatted_msg), loc);
+                log_impl(level, std::move(formatted_msg),
+                         SourceLoc{loc.file_name(), static_cast<int>(loc.line()),
+                                   loc.function_name()});
              }
 
     void add_sink(std::shared_ptr<Sink> sink){
@@ -143,11 +138,15 @@ public:
     bool propagate() const noexcept { return propagate_.load(std::memory_order_acquire); }
 
 private:
-    void log_impl(LogLevel level, std::string message, std::source_location sloc){
+    // 快路径核心：三个入口共享
+    //   log_at（宏）已做编译期校验；直接 API 由 LocFmt 构造时校验
+    template<typename... Args>
+    void log_dispatch(LogLevel level, TinyMeta* cs, Args&&... args);
+
+    void log_impl(LogLevel level, std::string message, SourceLoc loc){
         if(level < this->level()) return;
 
         static thread_local std::uint64_t tl_tid = platform::current_thread_id();
-        SourceLoc loc{sloc.file_name(), static_cast<int>(sloc.line()), sloc.function_name()};
         LogEvent event = {name_, level, std::move(message), Timestamp(), loc, tl_tid};
 
         auto fast = fast_sink_.load(std::memory_order_acquire);
@@ -164,6 +163,13 @@ private:
         std::shared_ptr<Logger> parent;
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            parent = parent_.lock();
+
+            // 无 sink 且不会 propagate 给 parent：日志必然丢失，一次性警告
+            if (sinks_.empty() && !(propagate() && parent)) {
+                warn_no_sink_once();
+            }
+
             if(level == LogLevel::FATAL){
                 dispatch_to_sinks(event);
                 flush_unlocked();
@@ -171,12 +177,21 @@ private:
             }
 
             dispatch_to_sinks(event);
-
-            parent = parent_.lock();
         }
 
         if(this->propagate() && parent){
-            parent->log_impl(level, event.message(), sloc);
+            parent->log_impl(level, event.message(), loc);
+        }
+    }
+    // 无 sink 警告只输出一次，避免刷屏；仅慢路径（已注定要格式化）检查
+    void warn_no_sink_once(){
+        bool expected = false;
+        if (warned_no_sink_.compare_exchange_strong(expected, true,
+                                                    std::memory_order_relaxed)) {
+            std::fprintf(stderr,
+                         "[cpp109] logger '%s' has no sinks and no parent; "
+                         "messages are dropped. Call add_sink() or set_parent().\n",
+                         name_.c_str());
         }
     }
     void dispatch_to_sinks(const LogEvent& event){
@@ -203,6 +218,7 @@ private:
     std::string       name_;
     std::atomic<LogLevel> level_ = LogLevel::INFO;
     std::atomic<bool> propagate_ = true;
+    std::atomic<bool> warned_no_sink_{false};
     std::weak_ptr<Logger> parent_;
     std::vector<std::shared_ptr<Sink>> sinks_;
     std::atomic<std::shared_ptr<Sink>> fast_sink_{nullptr};
@@ -210,110 +226,108 @@ private:
     std::mutex        mutex_;
 };
 
-// ─── FAST PATH MACRO (optimized, TinyHeader) ─────────────────────
-// For each log level method, the compiler-generated template body uses
-// one of three paths:
-//   1. Async single sink → TinyHeader + log_encoded (32B header, zero alloc)
-//   2. Sync single sink  → LogEvent + log_move (one allocation if SBO exceeded)
-//   3. Fallback (multi sink / parent) → log_impl (format + dispatch)
+// ─── LOGGER FAST PATH ────────────────────────────────────────────
+// 写入唯一入口为 LOG_* / LOG_*_TO 宏：宏在用户文件生成 static TinyMeta
+// （编译期常量地址），无需查找。Logger::log_at 校验编译期格式串后转发。
+// log_at 内分三级：
+//   1. Async single sink → TinyHeader + 批量缓冲（32B header，零堆分配）
+//   2. Sync single sink  → LogEvent + log_move（超 SBO 才堆分配）
+//   3. Fallback（多 sink / 有 parent）→ log_impl（格式化后分发）
 
-#define CPP109_LOGGER_METHOD_IMPL(method_name, level_enum)                      \
-    template<typename... Args>                                                 \
-    void Logger::method_name(std::format_string<Args...> fmt, Args&&... args)  \
-    {                                                                          \
-        if (level_enum < level_) return;                                       \
-        SourceLoc loc{__FILE__, __LINE__, __func__};                           \
-        /* extract raw format string */                                         \
-        const char* fmt_str = []<typename... Ts>(                              \
-            const std::format_string<Ts...>& f) -> const char* {               \
-            return reinterpret_cast<                                           \
-                const std::string_view*>(&f)->data();                          \
-        }.template operator()<Args...>(fmt);                                   \
-        static thread_local std::uint64_t tl_tid =                             \
-            platform::current_thread_id();                                     \
-        /* fast path 1: async sink -> TinyHeader + direct log_encoded */        \
-        auto* abase = cached_async_sink_;                                      \
-        if (abase && parent_.expired()) {                                      \
-            std::uint32_t args_size = 0;                                         \
-            if constexpr (sizeof...(Args) > 0) {                                \
-                args_size = static_cast<std::uint32_t>(                          \
-                    detail::compute_encoded_size(args...));                      \
-            }                                                                    \
-            std::byte* enc_buf = nullptr;                                        \
-            if (args_size > 0) {                                                 \
-                enc_buf = detail::get_encode_buffer(args_size);                  \
-                detail::encode_args(enc_buf, args...);                          \
-            }                                                                    \
-            /* 每个模板实例化一个唯一的 static TinyMeta（持久于 .data 段） */        \
-            static const TinyMeta _meta{                                        \
-                loc.file, loc.line, loc.func, fmt_str,                           \
-                sizeof...(Args) > 0                                              \
-                    ? &detail::decode_and_format<std::decay_t<Args>...>         \
-                    : nullptr                                                    \
-            };                                                                   \
-            /* 批量缓冲区：积累到 4KB 后一次提交（线程退出时自动提交剩余） */           \
-            const std::size_t needed = sizeof(TinyHeader) + args_size;             \
-            std::byte* batch_data = detail::tl_batch.data;                          \
-            std::size_t& batch_sz = detail::tl_batch.size;                         \
-            detail::tl_batch.sink = abase;                                         \
-                                                                                    \
-            if (batch_sz + needed > detail::BATCH_CAPACITY && batch_sz > 0) {     \
-                detail::tl_batch.flush();                                          \
-            }                                                                      \
-                                                                                   \
-            const std::size_t off = batch_sz;                                      \
-            batch_sz = off + needed;                                               \
-                                                                                   \
-            TinyHeader* hdr = reinterpret_cast<TinyHeader*>(batch_data + off);    \
-            hdr->timestamp_tsc = rdtsc_ns();                                       \
-            hdr->meta           = &_meta;                                           \
-            hdr->thread_id      = tl_tid;                                           \
-            hdr->args_size      = args_size;                                        \
-            hdr->level          = static_cast<uint8_t>(level_enum);                 \
-            hdr->flags          = 0;                                                \
-                                                                                   \
-            if (args_size > 0) {                                                    \
-                std::memcpy(batch_data + off + sizeof(TinyHeader),                  \
-                           enc_buf, args_size);                                     \
-            }                                                                      \
-                                                                                   \
-            if (level_enum == LogLevel::FATAL) {                                  \
-                detail::flush_deferred_batch();                                   \
-                abase->flush();                                                   \
-                std::abort();                                                     \
-            }                                                                     \
-            return;                                                              \
-        }                                                                        \
-        /* fast path 2: sync single sink -> LogEvent + log_move */               \
-        auto* fast_sync = cached_async_sink_ ? nullptr                            \
-            : fast_sink_.load(std::memory_order_acquire).get();                    \
-        if (fast_sync && parent_.expired()) {                                    \
-            LogEvent event(name_, level_enum, fmt_str, loc, tl_tid,              \
-                           std::forward<Args>(args)...);                         \
-            fast_sync->log_move(std::move(event));                               \
-            if (level_enum == LogLevel::FATAL) {                                 \
-                fast_sync->flush();                                              \
-                std::abort();                                                    \
-            }                                                                    \
-            return;                                                              \
-        }                                                                        \
-        /* slow path: multi sink or with parent -> log_impl */                    \
-        try {                                                                   \
-            log_impl(level_enum, std::format(fmt, std::forward<Args>(args)...),  \
-                     std::source_location::current());                           \
-        } catch (const std::format_error&) {                                    \
-            log_impl(level_enum, "[FORMAT_ERROR] fallback",                      \
-                     std::source_location::current());                           \
-        }                                                                        \
+template<typename... Args>
+void Logger::log_at(LogLevel level, TinyMeta* cs,
+                    std::format_string<Args...> fmt, Args&&... args)
+{
+    (void)fmt;   // 仅用于编译期格式串校验；运行时数据全部来自 cs
+    log_dispatch(level, cs, std::forward<Args>(args)...);
+}
+
+template<typename... Args>
+void Logger::log_dispatch(LogLevel level, TinyMeta* cs, Args&&... args)
+{
+    if (level < level_.load(std::memory_order_acquire)) return;
+
+    // decode_fn 只依赖参数类型组合，每个调用点恒定：首次调用惰性写入。
+    // 同一调用点的所有线程写入相同的值，atomic 消除数据竞争；
+    // worker 经 ring 的 release/acquire 同步后读取。
+    if constexpr (sizeof...(Args) > 0) {
+        if (cs->decode_fn.load(std::memory_order_relaxed) == nullptr) {
+            cs->decode_fn.store(&detail::decode_and_format<std::decay_t<Args>...>,
+                                std::memory_order_relaxed);
+        }
     }
 
-CPP109_LOGGER_METHOD_IMPL(trace, LogLevel::TRACE)
-CPP109_LOGGER_METHOD_IMPL(debug, LogLevel::DEBUG)
-CPP109_LOGGER_METHOD_IMPL(info,  LogLevel::INFO)
-CPP109_LOGGER_METHOD_IMPL(warn,  LogLevel::WARN)
-CPP109_LOGGER_METHOD_IMPL(error, LogLevel::ERROR)
-CPP109_LOGGER_METHOD_IMPL(fatal, LogLevel::FATAL)
+    static thread_local std::uint64_t tl_tid = platform::current_thread_id();
+    const char* fmt_str = cs->fmt;
+    SourceLoc loc{cs->file, cs->line, cs->func};
 
-#undef CPP109_LOGGER_METHOD_IMPL
+    // fast path 1: async sink -> TinyHeader + direct log_encoded
+    auto* abase = cached_async_sink_;
+    if (abase && parent_.expired()) {
+        std::uint32_t args_size = 0;
+        if constexpr (sizeof...(Args) > 0) {
+            args_size = static_cast<std::uint32_t>(
+                detail::compute_encoded_size(args...));
+        }
+        std::byte* enc_buf = nullptr;
+        if (args_size > 0) {
+            enc_buf = detail::get_encode_buffer(args_size);
+            detail::encode_args(enc_buf, args...);
+        }
+        // 批量缓冲区：积累到 4KB 后一次提交（线程退出时自动提交剩余）
+        const std::size_t needed = sizeof(TinyHeader) + args_size;
+        std::byte* batch_data = detail::tl_batch.data;
+        std::size_t& batch_sz = detail::tl_batch.size;
+        detail::tl_batch.sink = abase;
+
+        if (batch_sz + needed > detail::BATCH_CAPACITY && batch_sz > 0) {
+            detail::tl_batch.flush();
+        }
+
+        const std::size_t off = batch_sz;
+        batch_sz = off + needed;
+
+        TinyHeader* hdr = reinterpret_cast<TinyHeader*>(batch_data + off);
+        hdr->timestamp_tsc = rdtsc_ns();
+        hdr->meta           = cs;
+        hdr->thread_id      = tl_tid;
+        hdr->args_size      = args_size;
+        hdr->level          = static_cast<uint8_t>(level);
+        hdr->flags          = 0;
+
+        if (args_size > 0) {
+            std::memcpy(batch_data + off + sizeof(TinyHeader), enc_buf, args_size);
+        }
+
+        if (level == LogLevel::FATAL) {
+            detail::flush_deferred_batch();
+            abase->flush();
+            std::abort();
+        }
+        return;
+    }
+
+    // fast path 2: sync single sink -> LogEvent + log_move
+    auto* fast_sync = cached_async_sink_ ? nullptr
+        : fast_sink_.load(std::memory_order_acquire).get();
+    if (fast_sync && parent_.expired()) {
+        LogEvent event(name_, level, fmt_str, loc, tl_tid,
+                       std::forward<Args>(args)...);
+        fast_sync->log_move(std::move(event));
+        if (level == LogLevel::FATAL) {
+            fast_sync->flush();
+            std::abort();
+        }
+        return;
+    }
+
+    // slow path: multi sink or with parent -> log_impl
+    // 编译期校验已由入口完成，这里用 vformat（运行期格式串）
+    try {
+        log_impl(level, std::vformat(fmt_str, std::make_format_args(args...)), loc);
+    } catch (const std::format_error&) {
+        log_impl(level, "[FORMAT_ERROR] fallback", loc);
+    }
+}
 
 } // namespace cpp109

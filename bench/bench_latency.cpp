@@ -1,8 +1,8 @@
 // bench_latency.cpp — 用 rdtsc 精确测量异步入队延迟（精简版，P50 + P99）
 //
 // 测试场景:
-//   1. async + args   : logger->info("m {}", i)  — 完整路径（format + LogEvent构造 + log_move入队）
-//   2. async no args  : logger->info("hello world") — 快速路径（跳过 format，直接传字符串）
+//   1. async + args   : LOG_INFO_TO(logger, "m {}", i)  — 完整路径（format + LogEvent构造 + log_move入队）
+//   2. async no args  : LOG_INFO_TO(logger, "hello world") — 快速路径（跳过 format，直接传字符串）
 //
 // 编译:
 //   cl /std:c++20 /O2 /EHsc /I include bench\bench_latency.cpp /Fe:build_release\Release\bench_latency.exe
@@ -110,14 +110,14 @@ int main() {
 
     // 1a. 有参异步
     auto cycles_async_args = measure_latency(WARMUP, MEASURE, [&](int i) {
-        logger->info("m {}", i);
+        LOG_INFO_TO(logger, "m {}", i);
     });
     auto stats_async_args = compute_stats(cycles_async_args);
 
     // 1b. 无参异步
     auto cycles_async_noargs = measure_latency(WARMUP, MEASURE, [&](int i) {
         (void)i;
-        logger->info("hello world");
+        LOG_INFO_TO(logger, "hello world");
     });
     auto stats_async_noargs = compute_stats(cycles_async_noargs);
 

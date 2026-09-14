@@ -41,6 +41,7 @@ public:
 
     std::shared_ptr<Logger> set_default_logger(std::shared_ptr<Logger> logger){
         default_logger_.store(logger, std::memory_order_release);
+        default_logger_ptr_.store(logger.get(), std::memory_order_release);
         return logger;
     }
 
@@ -57,7 +58,19 @@ public:
         d->add_sink(console);
         default_sinks_.push_back(console);
         default_logger_.store(d, std::memory_order_release);
+        default_logger_ptr_.store(d.get(), std::memory_order_release);
         return d;
+    }
+
+    // 热路径入口（LOG_* 宏使用）：一次 acquire 裸指针加载，避免
+    // atomic<shared_ptr>::load 的引用计数/内部同步开销。
+    // 指向单例持有的 Logger，生命周期与进程相同。
+    Logger& default_logger_ref(){
+        auto* p = default_logger_ptr_.load(std::memory_order_acquire);
+        if (p) return *p;
+        auto d = default_logger();   // 首次创建，慢路径
+        default_logger_ptr_.store(d.get(), std::memory_order_release);
+        return *d;
     }
 
     void set_default_level(LogLevel level){
@@ -115,6 +128,7 @@ private:
     std::mutex mutex_;
     std::unordered_map<std::string, std::shared_ptr<Logger>> loggers_;
     std::atomic<std::shared_ptr<Logger>> default_logger_{nullptr};
+    std::atomic<Logger*> default_logger_ptr_{nullptr};   // default_logger_ref 热路径缓存
     std::vector<std::shared_ptr<Sink>> default_sinks_;
 };
 
