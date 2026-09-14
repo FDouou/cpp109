@@ -36,6 +36,7 @@ bench/results/
 
 # 本地保留、不提交的对照基准
 bench/bench_latency_quill_mt.cpp
+bench/bench_compare_quill.cpp
 bench/bench_latency_spdlog.cpp
 
 # IDE

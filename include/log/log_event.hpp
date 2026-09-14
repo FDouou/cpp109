@@ -264,13 +264,16 @@ void decode_and_format(const std::byte* ptr, const char* fmt, std::string& out) 
     }
 }
 
-// 前台线程的编码缓冲区（thread_local，首次调用分配后不再 realloc）
+// 前台线程的编码缓冲区（direct 模式）：小参数走固定 TLS 数组
+// （避免 vector 的间接访问与边界判断），超长参数回退 thread_local vector。
 inline std::byte* get_encode_buffer(std::size_t needed) {
-    thread_local static std::vector<std::byte> buf;
-    if (buf.size() < needed) {
-        buf.resize(needed + 64);  // 少量超额分配避免频繁 resizing
+    thread_local static std::byte small[1024];
+    if (needed <= sizeof(small)) return small;
+    thread_local static std::vector<std::byte> big;
+    if (big.size() < needed) {
+        big.resize(needed + 64);
     }
-    return buf.data();
+    return big.data();
 }
 
 } // namespace detail

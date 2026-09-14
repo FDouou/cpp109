@@ -114,7 +114,10 @@ public:
     // 批量提交预序列化的日志数据。data 指向连续的多条 (TinyHeader + args) 记录，
     // total_bytes 是总字节数。AsyncSink 一次性 prepare_write + memcpy + commit_write，
     // 将多次原子操作合并为一次，大幅降低入队延迟。
-    virtual void log_encoded_batch(const std::byte* data, std::size_t total_bytes) = 0;
+    // notify=false 用于定时兜底提交：数据入队但不必唤醒 worker（由 worker 的
+    // 轮询周期兜底消费），避免稀疏日志每条都触发 futex 唤醒。
+    virtual void log_encoded_batch(const std::byte* data, std::size_t total_bytes,
+                                   bool notify = true) = 0;
 
     // ── LogBackend worker / flush 接口 ──
     // 后台聚合线程通过这三个接口消费 ring，无需知道 AsyncSink 的具体实现。

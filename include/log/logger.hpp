@@ -22,9 +22,28 @@ namespace cpp109 {
 namespace detail {
     // 前台线程批量缓冲容量；可用 CPP109_BATCH_CAPACITY 覆盖（基准实验用）
 #ifndef CPP109_BATCH_CAPACITY
-#define CPP109_BATCH_CAPACITY 4096
+#define CPP109_BATCH_CAPACITY 16384
 #endif
     static constexpr std::size_t BATCH_CAPACITY = CPP109_BATCH_CAPACITY;
+
+    // 默认启用批量缓冲：未满时不触碰 ring、不唤醒 worker，低压场景
+    // P50/P99 显著优于逐条入队（见 bench/results/batch16k_vs_direct.txt）。
+    // 定义 CPP109_USE_BATCH=0 切回 direct（逐条入队）。
+#ifndef CPP109_USE_BATCH
+#define CPP109_USE_BATCH 1
+#endif
+
+    // 批量缓冲的定时提交阈值（TSC 周期，约 60~100ms 视 TSC 频率）。
+    // 稀疏日志不会填满批缓冲，靠该阈值保证最迟提交间隔；阈值偏小时
+    // （如 2ms）低速率多线程下每批条数不足 100，flush 样本占比会超过
+    // 1% 并推高 P99（实测 x32@0.5M 由 278ns 恶化到 3.1us）。默认取
+    // 100ms 量级：间歇式日志可攒数条再提交（实测 P50 再降约 40%），
+    // 代价是极稀疏日志落盘延迟上限相应变大。
+    // 定时提交不唤醒 worker（由 worker 轮询兜底），避免稀疏日志每条
+    // 触发 futex 唤醒。
+#ifndef CPP109_BATCH_FLUSH_INTERVAL_TSC
+#define CPP109_BATCH_FLUSH_INTERVAL_TSC 250000000ULL
+#endif
 
     struct BatchBuffer;
 
@@ -45,6 +64,7 @@ namespace detail {
         std::byte      data[BATCH_CAPACITY];
         std::size_t    size = 0;
         AsyncSinkBase* sink = nullptr;
+        std::uint64_t  last_flush_tsc = rdtsc_ns();   // 上次提交的 TSC
 
         BatchBuffer() {
             std::lock_guard<std::mutex> lk(batch_registry_mutex());
@@ -57,11 +77,14 @@ namespace detail {
             v.erase(std::remove(v.begin(), v.end(), this), v.end());
         }
 
-        void flush() {
+        // notify=false：定时兜底提交不唤醒 worker，由 worker 轮询周期消费。
+        // 否则稀疏日志（间隔 > 阈值）每条都触发一次 futex 唤醒。
+        void flush(bool notify = true) {
             if (size > 0 && sink) {
-                sink->log_encoded_batch(data, size);
+                sink->log_encoded_batch(data, size, notify);
                 size = 0;
             }
+            last_flush_tsc = rdtsc_ns();
         }
     };
 
@@ -123,6 +146,7 @@ public:
     void set_parent(const std::shared_ptr<Logger>& parent) {
         std::lock_guard<std::mutex> lock(mutex_);
         parent_ = parent;
+        parent_set_.store(static_cast<bool>(parent), std::memory_order_release);
     }
     std::shared_ptr<Logger> parent() const noexcept { return parent_.lock(); }
 
@@ -150,7 +174,7 @@ private:
         LogEvent event = {name_, level, std::move(message), Timestamp(), loc, tl_tid};
 
         auto fast = fast_sink_.load(std::memory_order_acquire);
-        if (fast && parent_.expired()) {
+        if (fast && !parent_set_.load(std::memory_order_acquire)) {
             if (level == LogLevel::FATAL) {
                 fast->log(event);
                 fast->flush();
@@ -164,6 +188,7 @@ private:
         {
             std::lock_guard<std::mutex> lock(mutex_);
             parent = parent_.lock();
+            if (!parent) parent_set_.store(false, std::memory_order_relaxed);
 
             // 无 sink 且不会 propagate 给 parent：日志必然丢失，一次性警告
             if (sinks_.empty() && !(propagate() && parent)) {
@@ -219,6 +244,7 @@ private:
     std::atomic<LogLevel> level_ = LogLevel::INFO;
     std::atomic<bool> propagate_ = true;
     std::atomic<bool> warned_no_sink_{false};
+    std::atomic<bool> parent_set_{false};   // parent_ 是否设置（免 weak_ptr::expired）
     std::weak_ptr<Logger> parent_;
     std::vector<std::shared_ptr<Sink>> sinks_;
     std::atomic<std::shared_ptr<Sink>> fast_sink_{nullptr};
@@ -230,7 +256,8 @@ private:
 // 写入唯一入口为 LOG_* / LOG_*_TO 宏：宏在用户文件生成 static TinyMeta
 // （编译期常量地址），无需查找。Logger::log_at 校验编译期格式串后转发。
 // log_at 内分三级：
-//   1. Async single sink → TinyHeader + 批量缓冲（32B header，零堆分配）
+//   1. Async single sink → 编码后逐条入队（默认 direct）
+//      （定义 CPP109_USE_BATCH=1 可改用 4KB 批量缓冲提交）
 //   2. Sync single sink  → LogEvent + log_move（超 SBO 才堆分配）
 //   3. Fallback（多 sink / 有 parent）→ log_impl（格式化后分发）
 
@@ -258,37 +285,41 @@ void Logger::log_dispatch(LogLevel level, TinyMeta* cs, Args&&... args)
     }
 
     static thread_local std::uint64_t tl_tid = platform::current_thread_id();
-    const char* fmt_str = cs->fmt;
-    SourceLoc loc{cs->file, cs->line, cs->func};
 
-    // fast path 1: async sink -> TinyHeader + direct log_encoded
+    // fast path 1: async sink -> encode + enqueue
+    const bool no_parent = !parent_set_.load(std::memory_order_acquire);
     auto* abase = cached_async_sink_;
-    if (abase && parent_.expired()) {
+    if (abase && no_parent) {
         std::uint32_t args_size = 0;
         if constexpr (sizeof...(Args) > 0) {
             args_size = static_cast<std::uint32_t>(
                 detail::compute_encoded_size(args...));
         }
-        std::byte* enc_buf = nullptr;
-        if (args_size > 0) {
-            enc_buf = detail::get_encode_buffer(args_size);
-            detail::encode_args(enc_buf, args...);
-        }
-        // 批量缓冲区：积累到 4KB 后一次提交（线程退出时自动提交剩余）
-        const std::size_t needed = sizeof(TinyHeader) + args_size;
+
+#if CPP109_USE_BATCH
+        // 批量缓冲：写 TLS，满 / 超时后一次提交。记录直接编码进批缓冲
+        // payload（省去中转拷贝）；本条 TSC 同时用于定时提交判断与时间戳。
+        const std::uint64_t now_tsc = rdtsc_ns();
         std::byte* batch_data = detail::tl_batch.data;
         std::size_t& batch_sz = detail::tl_batch.size;
         detail::tl_batch.sink = abase;
 
+        const std::size_t needed = sizeof(TinyHeader) + args_size;
         if (batch_sz + needed > detail::BATCH_CAPACITY && batch_sz > 0) {
             detail::tl_batch.flush();
+        } else if (batch_sz > 0 &&
+                   now_tsc - detail::tl_batch.last_flush_tsc >=
+                       CPP109_BATCH_FLUSH_INTERVAL_TSC) {
+            // 稀疏日志兜底：距上次提交超过阈值即提交（不唤醒 worker，
+            // 由 worker 轮询兜底消费）。避免长期滞留 TLS。
+            detail::tl_batch.flush(/*notify=*/false);
         }
 
         const std::size_t off = batch_sz;
         batch_sz = off + needed;
 
         TinyHeader* hdr = reinterpret_cast<TinyHeader*>(batch_data + off);
-        hdr->timestamp_tsc = rdtsc_ns();
+        hdr->timestamp_tsc = now_tsc;
         hdr->meta           = cs;
         hdr->thread_id      = tl_tid;
         hdr->args_size      = args_size;
@@ -296,7 +327,7 @@ void Logger::log_dispatch(LogLevel level, TinyMeta* cs, Args&&... args)
         hdr->flags          = 0;
 
         if (args_size > 0) {
-            std::memcpy(batch_data + off + sizeof(TinyHeader), enc_buf, args_size);
+            detail::encode_args(batch_data + off + sizeof(TinyHeader), args...);
         }
 
         if (level == LogLevel::FATAL) {
@@ -304,14 +335,29 @@ void Logger::log_dispatch(LogLevel level, TinyMeta* cs, Args&&... args)
             abase->flush();
             std::abort();
         }
+#else
+        // direct：每条立即入队（ring + notify），写入延迟可控
+        std::byte* enc_buf = nullptr;
+        if (args_size > 0) {
+            enc_buf = detail::get_encode_buffer(args_size);
+            detail::encode_args(enc_buf, args...);
+        }
+        abase->log_encoded(cs, level, tl_tid, rdtsc_ns(), enc_buf, args_size);
+
+        if (level == LogLevel::FATAL) {
+            abase->flush();
+            std::abort();
+        }
+#endif
         return;
     }
 
     // fast path 2: sync single sink -> LogEvent + log_move
     auto* fast_sync = cached_async_sink_ ? nullptr
         : fast_sink_.load(std::memory_order_acquire).get();
-    if (fast_sync && parent_.expired()) {
-        LogEvent event(name_, level, fmt_str, loc, tl_tid,
+    if (fast_sync && no_parent) {
+        LogEvent event(name_, level, cs->fmt,
+                       SourceLoc{cs->file, cs->line, cs->func}, tl_tid,
                        std::forward<Args>(args)...);
         fast_sync->log_move(std::move(event));
         if (level == LogLevel::FATAL) {
@@ -323,8 +369,9 @@ void Logger::log_dispatch(LogLevel level, TinyMeta* cs, Args&&... args)
 
     // slow path: multi sink or with parent -> log_impl
     // 编译期校验已由入口完成，这里用 vformat（运行期格式串）
+    const SourceLoc loc{cs->file, cs->line, cs->func};
     try {
-        log_impl(level, std::vformat(fmt_str, std::make_format_args(args...)), loc);
+        log_impl(level, std::vformat(cs->fmt, std::make_format_args(args...)), loc);
     } catch (const std::format_error&) {
         log_impl(level, "[FORMAT_ERROR] fallback", loc);
     }

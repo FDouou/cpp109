@@ -5,7 +5,7 @@ project(109cpp
     LANGUAGES CXX
 )
 
-# ── C++ 标准：强制 C++20（依赖 std::format + std::source_location）─────
+# ── C++ 标准：强制 C++20 ─────
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -40,23 +40,7 @@ endif()
 # 日志级别编译期开关（可选），低于该级别的宏调用在编译期优化掉
 # add_compile_definitions(LOG109CPP_ACTIVE_LEVEL=2)  # 0=TRACE, 1=DEBUG, 2=INFO ...
 
-# ── 第三方依赖 ──────────────────────────────────────────────────────
-include(FetchContent)
 
-# quill v8.2.0（异步日志库，用于 benchmark 对比）
-# 注意：quill 的 CMakeLists.txt 使用 project(quill) 默认启用 C 和 CXX。
-# 若 C 编译器检测失败（如缺少 Windows SDK），可设置以下变量跳过：
-#   set(CMAKE_C_COMPILER_WORKS TRUE CACHE INTERNAL "")
-FetchContent_Declare(
-    quill
-    GIT_REPOSITORY https://github.com/odygrd/quill.git
-    GIT_TAG        v8.2.0
-    GIT_SHALLOW    TRUE
-)
-set(QUILL_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
-set(QUILL_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
-set(QUILL_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(quill)
 
 # ── 库目标（header-only）──────────────────────────────────────────
 add_library(109cpp INTERFACE)
@@ -116,9 +100,7 @@ add_executable(test_callsite tests/test_callsite.cpp)
 target_link_libraries(test_callsite 109cpp)
 add_test(NAME test_callsite COMMAND test_callsite)
 
-# ── 性能基准（手动运行，不加入 ctest）────────────────────────────
-# 注：吞吐量基准（bench.cpp、bench_thru_*、bench_comparison 等）与重复的
-#     bench_latency_breakdown 已删除，只保留入队延迟相关的基准。
+# ── 性能基准（手动运行，不加入 ctest）
 add_executable(bench_latency bench/bench_latency.cpp)
 target_link_libraries(bench_latency 109cpp)
 
@@ -128,8 +110,11 @@ target_link_libraries(bench_latency_instrumented 109cpp)
 add_executable(bench_latency_mt bench/bench_latency_mt.cpp)
 target_link_libraries(bench_latency_mt 109cpp)
 
+add_executable(bench_throughput bench/bench_throughput.cpp)
+target_link_libraries(bench_throughput 109cpp)
+
+add_executable(bench_compare bench/bench_compare.cpp)
+target_link_libraries(bench_compare 109cpp)
+
 add_executable(batch_test bench/batch_test.cpp)
 target_link_libraries(batch_test 109cpp)
-
-add_executable(bench_latency_quill bench/bench_latency_quill.cpp)
-target_link_libraries(bench_latency_quill PRIVATE quill::quill)
