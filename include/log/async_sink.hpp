@@ -89,7 +89,7 @@ class AsyncSink final : public AsyncSinkBase {
     static_assert((QueueCapacity & (QueueCapacity - 1)) == 0, "capacity must be power of 2");
 
     struct ThreadSlot {
-        ByteRingBuffer<QueueCapacity, Policy> ring;
+        ByteRingBuffer<QueueCapacity> ring;
         // 背压控制：ring 满时 producer 在 cv 上等待（不空转），
         // worker 消费腾出空间后 notify。仅 BLOCK 策略使用。
         std::mutex               cv_mtx;
@@ -238,7 +238,7 @@ protected:
     void write(const std::string&, const LogEvent&) override {}
 
 private:
-    using Chunk = typename ByteRingBuffer<QueueCapacity, Policy>::Chunk;
+    using Chunk = typename ByteRingBuffer<QueueCapacity>::Chunk;
 
     // 空间准备：BLOCK 策略等待 worker 腾空间；DROP_NEWEST 直接失败。
     // 记录/整批大于队列容量时无法入队（返回空 Chunk，调用者丢弃）。

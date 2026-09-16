@@ -38,6 +38,7 @@ bench/results/
 bench/bench_latency_quill_mt.cpp
 bench/bench_compare_quill.cpp
 bench/bench_latency_spdlog.cpp
+bench/burst_quill.cpp
 
 # IDE
 .vscode/

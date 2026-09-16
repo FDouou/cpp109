@@ -11,7 +11,10 @@
 
 namespace cpp109 {
 
-enum class OverflowPolicy;
+enum class OverflowPolicy {
+    BLOCK,
+    DROP_NEWEST,
+};
 
 template<std::size_t, OverflowPolicy>
 class AsyncSink;

@@ -7,11 +7,6 @@
 
 namespace cpp109 {
 
-enum class OverflowPolicy {
-    BLOCK,
-    DROP_NEWEST,
-};
-
 // 单生产者单消费者字节环形缓冲（SPSC）。
 //
 // 存储为 Capacity 字节（不是历史实现里的 2*Capacity）；跨尾写入/读取通过
@@ -22,7 +17,7 @@ enum class OverflowPolicy {
 //
 // 热路径空间判断常态走本地缓存的读指针（cached_reader_pos_），
 // 仅在疑似空间不足时才跨线程 acquire 读真实消费位置。
-template<std::size_t Capacity = 1 << 20, OverflowPolicy Policy = OverflowPolicy::BLOCK>
+template<std::size_t Capacity = 1 << 20>
 class ByteRingBuffer {
     static_assert((Capacity & (Capacity - 1)) == 0, "Capacity must be a power of 2");
     static_assert(Capacity >= 64, "Capacity too small");
