@@ -5,6 +5,7 @@
 #include "ring_buffer.hpp"
 #include "platform.hpp"
 #include "backend.hpp"
+#include "rdtsc_clock.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -19,57 +20,8 @@
 
 namespace cpp109 {
 
-// ── RdtscClock：将 rdtsc 值转换为 wall-clock 纳秒（全局单例，只校准一次）──
-class RdtscClock {
-public:
-    static const RdtscClock& instance() noexcept {
-        static const RdtscClock clock;
-        return clock;
-    }
-
-    std::uint64_t to_ns(std::uint64_t tsc) const noexcept {
-        auto delta = tsc - base_tsc_;
-#ifdef _MSC_VER
-        // MSVC: 用 _umul128 + _udiv128 做 128 位精确除法
-        unsigned __int64 hi;
-        unsigned __int64 lo = _umul128(delta, 1000000000ULL, &hi);
-        unsigned __int64 rem;
-        unsigned __int64 quot = _udiv128(hi, lo, tsc_freq_int_, &rem);
-        return base_ns_ + static_cast<std::uint64_t>(quot);
-#else
-        return base_ns_ + static_cast<std::uint64_t>(
-            static_cast<double>(delta) * 1e9 / static_cast<double>(tsc_freq_int_));
-#endif
-    }
-
-    // 纳秒 → TSC 周期（用于唤醒限流阈值换算）
-    std::uint64_t ns_to_tsc(std::uint64_t ns) const noexcept {
-        return ns * tsc_freq_int_ / 1000000000ULL;
-    }
-
-private:
-    RdtscClock() noexcept {
-        base_tsc_  = rdtsc_ns();
-        auto bt = std::chrono::system_clock::now();
-        base_ns_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            bt.time_since_epoch()).count();
-
-        auto t1 = std::chrono::steady_clock::now();
-        auto c1 = rdtsc_ns();
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        auto c2 = rdtsc_ns();
-        auto t2 = std::chrono::steady_clock::now();
-
-        double sec = std::chrono::duration<double>(t2 - t1).count();
-        tsc_freq_ = static_cast<double>(c2 - c1) / sec;
-        tsc_freq_int_ = static_cast<std::uint64_t>(tsc_freq_);
-    }
-
-    std::uint64_t base_tsc_ = 0;
-    std::uint64_t base_ns_  = 0;
-    double        tsc_freq_ = 1.0;
-    std::uint64_t tsc_freq_int_ = 1;
-};
+// ── RdtscClock：rdtsc → wall-clock 纳秒换算与周期校准，定义见 rdtsc_clock.hpp ──
+// 由 LogBackend worker 每轮循环调用 calibrate()（内部 1s 节流 + CAS 抢单）。
 
 // ── AsyncSink：纯队列包装器（不再持有线程）──
 // 后台线程由全局 LogBackend 统一提供（默认 1 个），本类只负责：

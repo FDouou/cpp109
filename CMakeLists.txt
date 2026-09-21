@@ -100,6 +100,10 @@ add_executable(test_callsite tests/test_callsite.cpp)
 target_link_libraries(test_callsite 109cpp)
 add_test(NAME test_callsite COMMAND test_callsite)
 
+add_executable(test_clock tests/test_clock.cpp)
+target_link_libraries(test_clock 109cpp)
+add_test(NAME test_clock COMMAND test_clock)
+
 # ── 性能基准（手动运行，不加入 ctest）
 add_executable(bench_latency bench/bench_latency.cpp)
 target_link_libraries(bench_latency 109cpp)

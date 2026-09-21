@@ -3,6 +3,7 @@
 #include "log_level.hpp"
 #include "log_event.hpp"
 #include "sink.hpp"
+#include "rdtsc_clock.hpp"
 
 #include <atomic>
 #include <algorithm>

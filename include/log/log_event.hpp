@@ -21,13 +21,6 @@
 #include <utility>
 #include <vector>
 
-// ── 平台相关的 RDTSC ──
-#if defined(_MSC_VER)
-    #include <intrin.h>
-#elif defined(__x86_64__) || defined(__i386__)
-    #include <x86intrin.h>
-#endif
-
 namespace cpp109 {
 
 // ── SourceLoc：编译期零开销的源码位置（替代 std::source_location） ──
@@ -37,20 +30,7 @@ struct SourceLoc {
     const char* func;
 };
 
-// ── RDTSC 时钟周期（前台时间戳，开销 ~10ns，远快于 system_clock） ──
-inline std::uint64_t rdtsc_ns() noexcept {
-#if defined(_MSC_VER)
-    return __rdtsc();
-#elif defined(__x86_64__) || defined(__i386__)
-    unsigned int lo, hi;
-    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
-    return (static_cast<std::uint64_t>(hi) << 32) | lo;
-#else
-    // 非 x86 回退到 steady_clock
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
-#endif
-}
+// ── RDTSC 时钟周期见 log/rdtsc_clock.hpp（前台时间戳，开销 ~10ns）──
 
 // ── TinyMeta：每个日志调用点一份的持久元数据 ──
 // 宏路径（LOG_* / LOG_*_TO）在用户文件生成 static 实例（地址为编译期常量）；

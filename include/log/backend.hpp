@@ -1,6 +1,7 @@
 #pragma once
 
 #include "platform.hpp"
+#include "rdtsc_clock.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -160,6 +161,9 @@ inline void LogBackend::stop() {
 
 inline void LogBackend::shard_worker(Shard* shard) {
     while (true) {
+        // rdtsc 周期锚定：内部 1s 节流 + CAS 抢单，忙轮次只付一次稳态时钟读
+        RdtscClock::instance().calibrate();
+
         bool progress = false;
         bool has_data = false;
         {
