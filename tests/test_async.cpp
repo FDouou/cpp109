@@ -149,12 +149,68 @@ CPP109_TEST(async_codec_string_family)
     std::remove(filename);
 }
 
+// 回归测试：单条记录超过 TLS 批缓冲容量（默认 16KB）必须降级为 direct
+// 单条入队。曾因缺少降级导致 needed > BATCH_CAPACITY 的记录直接写 TLS
+// 批缓冲数组越界（旧逻辑只 flush 不清算，仍从 offset 0 写超长负载）。
+CPP109_TEST(async_large_string_fallback)
+{
+    const char* filename = "test_async_large_string.log";
+    constexpr std::size_t kBigLen = 64 * 1024;   // 4× 默认批缓冲容量
+
+    const std::size_t payload_max =
+        cpp109::detail::BATCH_CAPACITY - sizeof(cpp109::TinyHeader) -
+        sizeof(std::uint32_t);
+
+    std::string big(kBigLen, 'A');
+    big.front() = '<';
+    big.back()  = '>';
+    // needed == BATCH_CAPACITY 恰好占满批缓冲（不越界）；
+    // +1 字节即触发降级路径。
+    std::string exact(payload_max, 'E');
+    std::string exact_plus1(payload_max + 1, 'F');
+    // 超过 ring 容量（默认 1MB）的记录按策略丢弃，不得死等（BLOCK 策略）
+    std::string huge((1u << 20) + 1024, 'H');
+
+    {
+        auto logger = std::make_shared<cpp109::Logger>("large_string");
+        auto async = std::make_shared<cpp109::AsyncSink<>>(
+            std::make_shared<cpp109::FileSink>(filename, true));
+        logger->add_sink(async);
+        logger->set_level(cpp109::LogLevel::TRACE);
+
+        LOG_INFO_TO(logger, "small-before={}", 1);
+        LOG_INFO_TO(logger, "big={}", big);
+        LOG_INFO_TO(logger, "exact={}", exact);
+        LOG_INFO_TO(logger, "exact_plus1={}", exact_plus1);
+        LOG_INFO_TO(logger, "huge={}", huge);
+        LOG_INFO_TO(logger, "small-after={}", 2);
+
+        logger->flush();
+    }
+
+    std::ifstream ifs(filename, std::ios::binary);
+    CPP109_ASSERT(ifs.is_open());
+    std::string content((std::istreambuf_iterator<char>(ifs)),
+                        std::istreambuf_iterator<char>());
+    ifs.close();
+
+    CPP109_ASSERT(content.find("small-before=1") != std::string::npos);
+    CPP109_ASSERT(content.find("big=" + big) != std::string::npos);       // 未截断
+    CPP109_ASSERT(content.find("exact=" + exact) != std::string::npos);   // 填满批
+    CPP109_ASSERT(content.find("exact_plus1=" + exact_plus1) != std::string::npos);
+    CPP109_ASSERT(content.find("huge=") == std::string::npos);            // 超 ring 丢弃
+    CPP109_ASSERT(content.find("small-after=2") != std::string::npos);    // 降级后批次状态正常
+
+    std::remove(filename);
+}
+
 } // anonymous namespace
 
 int main() {
     test_async_sink_basic();
     test_async_multithread();
     test_async_codec_string_family();
+    test_async_large_string_fallback();
 
     fprintf(stdout, "test_async.cpp: all tests passed\n");
     return 0;

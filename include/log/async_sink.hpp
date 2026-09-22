@@ -20,6 +20,15 @@
 
 namespace cpp109 {
 
+// 全局 AsyncSink 实例序号：TLS 分片缓存用（owner 指针 + 实例号）校验，
+// 防止旧 sink 析构、新 sink 复用同一堆地址时缓存误命中悬垂 ThreadSlot。
+namespace detail {
+inline std::atomic<std::uint64_t>& async_sink_instance_seq() noexcept {
+    static std::atomic<std::uint64_t> seq{0};
+    return seq;
+}
+} // namespace detail
+
 // ── RdtscClock：rdtsc → wall-clock 纳秒换算与周期校准，定义见 rdtsc_clock.hpp ──
 // 由 LogBackend worker 每轮循环调用 calibrate()（内部 1s 节流 + CAS 抢单）。
 
@@ -58,7 +67,6 @@ class AsyncSink final : public AsyncSinkBase {
 public:
     explicit AsyncSink(std::shared_ptr<Sink> wrapped)
         : wrapped_(std::move(wrapped))
-        , shard_index_(LogBackend::instance().register_sink(this))
     {
         // 唤醒限流阈值：默认 1ms。direct 模式下每条日志都可能 notify；
         // worker 睡眠时一次 futex wake 约 1~2us，低频日志会被显著放大。
@@ -66,6 +74,15 @@ public:
         // 中间的日志由 worker 的 50us 睡眠超时轮询兜底（落盘延迟上限
         // 一个轮询周期），生产者侧避免每条 futex 唤醒。
         notify_interval_tsc_ = RdtscClock::instance().ns_to_tsc(1'000'000);
+
+        // TLS 分片缓存校验用实例号（先于注册赋值，见 register 说明）。
+        instance_id_ = detail::async_sink_instance_seq().fetch_add(1, std::memory_order_relaxed) + 1;
+
+        // 注册必须是构造函数的最后一步：worker 拿到 sinks 列表后会立即
+        // 回调 has_pending() / drain_one()。若在初始化列表中注册，此时
+        // slots_ / slots_mtx_ 等成员尚未构造，worker 会访问未初始化内存
+        // （未构造的 unordered_map 指针被填充值污染）导致间歇性崩溃。
+        shard_index_ = LogBackend::instance().register_sink(this);
     }
 
     ~AsyncSink() override {
@@ -264,18 +281,21 @@ private:
     // 命中缓存（owner==this）即无锁直达分片 ring；未命中则查表（懒创建）。
     ThreadSlot* current_slot(std::uint64_t thread_id) {
         thread_local struct SlotCache {
-            AsyncSink* owner = nullptr;
-            ThreadSlot* slot = nullptr;
+            AsyncSink*    owner    = nullptr;
+            std::uint64_t owner_id = 0;
+            ThreadSlot*   slot     = nullptr;
         } tls;
 
-        if (tls.owner == this && tls.slot) return tls.slot;
+        if (tls.owner == this && tls.owner_id == instance_id_ && tls.slot)
+            return tls.slot;
 
         std::lock_guard<std::mutex> lk(slots_mtx_);
         auto it = slots_.find(thread_id);
         if (it == slots_.end())
             it = slots_.emplace(thread_id, std::make_unique<ThreadSlot>()).first;
-        tls.owner = this;
-        tls.slot = it->second.get();
+        tls.owner    = this;
+        tls.owner_id = instance_id_;
+        tls.slot     = it->second.get();
         return tls.slot;
     }
 
@@ -380,7 +400,8 @@ private:
     void flush_wrapped() override { wrapped_->flush(); }
 
     std::shared_ptr<Sink> wrapped_;
-    std::size_t shard_index_;
+    std::size_t shard_index_ = 0;             // 构造尾部由 register_sink 赋值
+    std::uint64_t instance_id_ = 0;           // TLS 缓存校验用（全局唯一）
     std::uint64_t notify_interval_tsc_ = 0;   // 唤醒限流阈值（TSC 周期）
 
     mutable std::mutex slots_mtx_;

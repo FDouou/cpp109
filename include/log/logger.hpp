@@ -306,29 +306,42 @@ void Logger::log_dispatch(LogLevel level, TinyMeta* cs, Args&&... args)
         detail::tl_batch.sink = abase;
 
         const std::size_t needed = sizeof(TinyHeader) + args_size;
-        if (batch_sz + needed > detail::BATCH_CAPACITY && batch_sz > 0) {
+        if (needed > detail::BATCH_CAPACITY) {
+            // 单条记录超过批缓冲容量（大字符串等）：批缓冲放不下，先提交
+            // 已攒批次，本条降级为 direct 单条入队。编码缓冲超 1KB 自动
+            // 回退堆分配；记录若再超 ring 容量则由入队侧按策略丢弃。
             detail::tl_batch.flush();
-        } else if (batch_sz > 0 &&
-                   now_tsc - detail::tl_batch.last_flush_tsc >=
-                       CPP109_BATCH_FLUSH_INTERVAL_TSC) {
-            // 稀疏日志兜底：距上次提交超过阈值即提交（不唤醒 worker，
-            // 由 worker 轮询兜底消费）。避免长期滞留 TLS。
-            detail::tl_batch.flush(/*notify=*/false);
-        }
+            std::byte* enc_buf = nullptr;
+            if (args_size > 0) {
+                enc_buf = detail::get_encode_buffer(args_size);
+                detail::encode_args(enc_buf, args...);
+            }
+            abase->log_encoded(cs, level, tl_tid, now_tsc, enc_buf, args_size);
+        } else {
+            if (batch_sz + needed > detail::BATCH_CAPACITY && batch_sz > 0) {
+                detail::tl_batch.flush();
+            } else if (batch_sz > 0 &&
+                       now_tsc - detail::tl_batch.last_flush_tsc >=
+                           CPP109_BATCH_FLUSH_INTERVAL_TSC) {
+                // 稀疏日志兜底：距上次提交超过阈值即提交（不唤醒 worker，
+                // 由 worker 轮询兜底消费）。避免长期滞留 TLS。
+                detail::tl_batch.flush(/*notify=*/false);
+            }
 
-        const std::size_t off = batch_sz;
-        batch_sz = off + needed;
+            const std::size_t off = batch_sz;
+            batch_sz = off + needed;
 
-        TinyHeader* hdr = reinterpret_cast<TinyHeader*>(batch_data + off);
-        hdr->timestamp_tsc = now_tsc;
-        hdr->meta           = cs;
-        hdr->thread_id      = tl_tid;
-        hdr->args_size      = args_size;
-        hdr->level          = static_cast<uint8_t>(level);
-        hdr->flags          = 0;
+            TinyHeader* hdr = reinterpret_cast<TinyHeader*>(batch_data + off);
+            hdr->timestamp_tsc = now_tsc;
+            hdr->meta           = cs;
+            hdr->thread_id      = tl_tid;
+            hdr->args_size      = args_size;
+            hdr->level          = static_cast<uint8_t>(level);
+            hdr->flags          = 0;
 
-        if (args_size > 0) {
-            detail::encode_args(batch_data + off + sizeof(TinyHeader), args...);
+            if (args_size > 0) {
+                detail::encode_args(batch_data + off + sizeof(TinyHeader), args...);
+            }
         }
 
         if (level == LogLevel::FATAL) {
