@@ -155,6 +155,11 @@ public:
     virtual bool has_pending() const = 0;   // ring 是否还有未处理记录
     virtual bool drain_one() = 0;           // 取一条记录解码并写入底层 Sink，返回是否处理
     virtual void flush_wrapped() = 0;       // flush 底层 Sink
+
+    // 写者线程退出时上报（由 detail::BatchBuffer 析构调用）：该 thread_id 的
+    // 分片已无写者，worker 排空后可回收。默认无操作——仅异步分片 sink 需要，
+    // 普通 Sink 无分片概念。
+    virtual void retire_shard(std::uint64_t /*thread_id*/) noexcept {}
 };
 
 } // namespace cpp109

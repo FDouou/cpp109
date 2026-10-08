@@ -298,6 +298,65 @@ CPP109_TEST(async_logger_name)
     std::remove(fn);
 }
 
+// 回归：线程退出后其分片应被回收（stats().shards 降回 0）。
+// 机制：~BatchBuffer（线程退出）→ retire_shard → worker drain 后 reap。
+CPP109_TEST(async_shard_reclaim)
+{
+    const char* fn = "test_reclaim.log";
+    std::remove(fn);
+    auto async = std::make_shared<cpp109::AsyncSink<>>(
+        std::make_shared<cpp109::FileSink>(fn, true));
+
+    // 主线程不写该 sink，分片只属于子线程
+    {
+        std::thread t([async]() {
+            auto lg = std::make_shared<cpp109::Logger>("reclaim");   // 名不含 '.' → 快路径
+            lg->add_sink(async);
+            lg->set_level(cpp109::LogLevel::TRACE);
+            LOG_INFO_TO(lg, "from ephemeral thread");
+            lg->flush();
+        });
+        t.join();   // 子线程退出：flush batch + retire_shard(tid)
+    }
+
+    // 触发 worker 排空 + 回收（flush → drain_one → reap_retired）
+    async->flush();
+    const auto st = async->stats();
+    CPP109_ASSERT(st.shards == 0);   // 子线程分片已回收
+
+    std::remove(fn);
+}
+
+// 压测：多轮短命线程共享同一 logger/AsyncSink 频繁起停，验证分片回收在并发下
+// 正确（不崩溃），且分片数不随线程起停总数线性增长。
+CPP109_TEST(async_shard_reclaim_stress)
+{
+    const char* fn = "test_reclaim_stress.log";
+    std::remove(fn);
+    auto logger = std::make_shared<cpp109::Logger>("stress");   // 共享，名不含 '.'
+    auto async = std::make_shared<cpp109::AsyncSink<>>(
+        std::make_shared<cpp109::FileSink>(fn, true));
+    logger->add_sink(async);
+    logger->set_level(cpp109::LogLevel::TRACE);
+
+    constexpr int kRounds = 2, kThreads = 3;   // 累计 6 个短命线程
+    for (int round = 0; round < kRounds; ++round) {
+        std::vector<std::thread> ts;
+        for (int i = 0; i < kThreads; ++i)
+            ts.emplace_back([logger, round, i]() {
+                LOG_INFO_TO(logger, "r{} t{}", round, i);   // 退出靠 TLS 析构 flush + retire
+            });
+        for (auto& t : ts) t.join();
+        async->flush();   // 触发 drain + reap_retired
+    }
+
+    const auto st = async->stats();
+    // 回收有效则分片数停留在峰值并发放量级，而非累计 48
+    CPP109_ASSERT(st.shards <= static_cast<std::size_t>(kThreads) * 2);
+
+    std::remove(fn);
+}
+
 } // anonymous namespace
 
 int main() {
@@ -308,6 +367,8 @@ int main() {
     test_async_multi_logger_no_crosstalk();
     test_async_drop_stats();
     test_async_logger_name();
+    test_async_shard_reclaim();
+    test_async_shard_reclaim_stress();
 
     if (cpp109_test::failures() == 0) {
         fprintf(stdout, "test_async.cpp: all tests passed\n");

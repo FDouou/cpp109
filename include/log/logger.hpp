@@ -88,15 +88,40 @@ namespace detail {
         AsyncSinkBase* sink = nullptr;
         std::uint64_t  last_flush_tsc = rdtsc_ns();   // 上次提交的 TSC
 
+        // 本线程写过的 async sink（**强引用**，保证 ~BatchBuffer 上报时 sink 仍存活，
+        // 避免"线程独占 logger、logger 先于 thread_local 析构"导致的悬垂）。
+        // 线程退出时据此通知各 sink 回收本线程分片。仅在换 sink 时登记（稳态零开销）；
+        // 超过上限后不再追踪（对应分片不回收，退化为随 AsyncSink 析构整体释放）。
+        static constexpr std::size_t kMaxTrackedSinks = 8;
+        std::shared_ptr<AsyncSinkBase> tracked[kMaxTrackedSinks];
+        std::size_t    tracked_count = 0;
+        std::uint64_t  tid = platform::current_thread_id();   // 本线程 id（= 分片 key）
+
         BatchBuffer() {
             std::lock_guard<std::mutex> lk(batch_registry_mutex());
             active_batches().push_back(this);
         }
         ~BatchBuffer() {
             flush();
+            // 线程退出上报：通知所有写过的 sink——本线程分片已无写者，worker 排空后
+            // 可回收。tracked 是强引用，此处 sink 保证存活。信号来自线程自身析构，
+            // 不需要 worker 去猜线程死活，也天然规避 tid 复用（上报发生在 OS 释放
+            // tid 之前）。
+            for (std::size_t i = 0; i < tracked_count; ++i)
+                if (tracked[i]) tracked[i]->retire_shard(tid);
             std::lock_guard<std::mutex> lk(batch_registry_mutex());
             auto& v = active_batches();
             v.erase(std::remove(v.begin(), v.end(), this), v.end());
+        }
+
+        // 登记本线程写过的 async sink（幂等）。仅换 sink 时调用，热路径稳态不触碰。
+        void track_sink(const std::shared_ptr<Sink>& s) {
+            auto* base = dynamic_cast<AsyncSinkBase*>(s.get());
+            if (!base) return;
+            for (std::size_t i = 0; i < tracked_count; ++i)
+                if (tracked[i].get() == base) return;
+            if (tracked_count < kMaxTrackedSinks)
+                tracked[tracked_count++] = std::static_pointer_cast<AsyncSinkBase>(s);
         }
 
         // notify=false：定时兜底提交不唤醒 worker，由 worker 轮询周期消费。
@@ -363,11 +388,15 @@ void Logger::log_dispatch(LogLevel level, TinyMeta* cs, Args&&... args)
         // 若本线程在一个批周期内切到另一个 async sink，必须先用【旧 sink】提交
         // 缓冲里的旧数据，否则旧记录会被后面整批交给新 sink，落进错误的文件。
         // 正常用法（一线程一 async logger）下 sink 恒等于 abase，仅一次指针比较。
-        if (batch_sz > 0 && detail::tl_batch.sink != abase) {
-            detail::tl_batch.flush();
-            detail::tl_batch.warn_sink_switch_once();
+        // 换 sink 时顺带登记该 sink（供线程退出时上报回收分片）。
+        if (detail::tl_batch.sink != abase) {
+            if (batch_sz > 0) {
+                detail::tl_batch.flush();
+                detail::tl_batch.warn_sink_switch_once();
+            }
+            detail::tl_batch.track_sink(fast_sink_.load(std::memory_order_acquire));
+            detail::tl_batch.sink = abase;
         }
-        detail::tl_batch.sink = abase;
 
         const std::size_t needed = sizeof(TinyHeader) + args_size;
         if (needed > detail::BATCH_CAPACITY) {
@@ -414,7 +443,12 @@ void Logger::log_dispatch(LogLevel level, TinyMeta* cs, Args&&... args)
             std::abort();
         }
 #else
-        // direct：每条立即入队（ring + notify），写入延迟可控
+        // direct：每条立即入队（ring + notify），写入延迟可控。
+        // 换 sink 时登记（供线程退出回收分片）。
+        if (detail::tl_batch.sink != abase) {
+            detail::tl_batch.track_sink(fast_sink_.load(std::memory_order_acquire));
+            detail::tl_batch.sink = abase;
+        }
         std::byte* enc_buf = nullptr;
         if (args_size > 0) {
             enc_buf = detail::get_encode_buffer(args_size);

@@ -223,7 +223,7 @@ ctest --test-dir build
 
 不满足则退化
 
-批收益前提：同一线程不要交替调用不同的 async logger（换 sink 会强制提交、逼近 direct 开销；输出仍正确，仅损失批收益）。落盘延迟敏感改用 `CPP109_USE_BATCH=0`或关键点 `logger->flush()`；默认 batch 落盘延迟无上限。
+批收益前提：同一线程不要交替写**不同的 `AsyncSink`**（多个 logger 共享同一个 `AsyncSink` 不受限；换 sink 会强制提交、逼近 direct 开销，输出仍正确）。落盘延迟敏感改用 `CPP109_USE_BATCH=0` 或关键点 `logger->flush()`；默认 batch 落盘延迟无上限。
 
 ## 性能
 

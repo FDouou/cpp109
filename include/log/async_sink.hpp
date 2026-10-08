@@ -44,7 +44,9 @@ inline std::atomic<std::uint64_t>& async_sink_instance_seq() noexcept {
 //      - slots_ 表以 thread_id 为键持有各线程分片（unique_ptr）；
 //      - 写者恒为该线程自身 → 每个分片仍是无锁 SPSC；
 //      - worker 单后台线程逐分片轮转排空 → 文件只有 worker 一个写者。
-//   回收：分片不做线程退出回收（日志线程通常长命），AsyncSink 析构时整表释放。
+//   回收：线程退出时其 BatchBuffer（thread_local）上报 retire_shard，worker 排空
+//         该分片后经 reap_retired 释放；AsyncSink 析构时整表释放。早期版本不做
+//         线程退出回收（依赖日志线程长命），后补齐以支持短命线程池。
 template<std::size_t QueueCapacity = 1 << 20, OverflowPolicy Policy = OverflowPolicy::BLOCK>
 class AsyncSink final : public AsyncSinkBase {
     static_assert((QueueCapacity & (QueueCapacity - 1)) == 0, "capacity must be power of 2");
@@ -62,6 +64,9 @@ class AsyncSink final : public AsyncSinkBase {
         // clear-then-check 清除。使 has_pending / pick_slot 不必扫描 ring
         // 状态行（减少低压场景 worker 轮询对生产者 cache line 的干扰）。
         std::atomic<bool>        pending{false};
+        // 写者线程已退出（retire_shard 置位）；worker 把该分片排空后可回收释放。
+        // 若同一 tid 被新线程复用，current_slot 会清除此标记并复用该分片。
+        std::atomic<bool>        retired{false};
     };
 
 public:
@@ -73,13 +78,16 @@ public:
         std::uint64_t dropped_oversize   = 0;  // 单条记录 > ring 容量，无法入队的次数
         std::uint64_t dropped_destructor = 0;  // 析构时随分片整表释放而丢弃的字节数
         std::uint64_t blocked_waits      = 0;  // BLOCK：生产者等待 worker 腾空间的次数
+        std::size_t   shards             = 0;  // 当前分片数（每线程每 sink 一片；线程退出后由 worker 回收）
     };
-    Stats stats() const noexcept {
+    Stats stats() const {
+        std::lock_guard<std::mutex> lk(slots_mtx_);
         return Stats{
             dropped_ring_full_.load(std::memory_order_relaxed),
             dropped_oversize_.load(std::memory_order_relaxed),
             dropped_destructor_.load(std::memory_order_relaxed),
             blocked_waits_.load(std::memory_order_relaxed),
+            slots_.size(),
         };
     }
 
@@ -110,6 +118,18 @@ public:
         std::uint64_t residual = 0;
         for (auto& kv : slots_) residual += kv.second->ring.readable();
         if (residual) dropped_destructor_.fetch_add(residual, std::memory_order_relaxed);
+    }
+
+    // 写者线程退出上报（由 detail::BatchBuffer 析构调用）：标记该 thread_id 的
+    // 分片待回收。**不立即删除**——worker 可能正持其裸指针解码，且别线程的写者
+    // TLS 缓存也可能指向它；交由其排空后经 reap_retired() 释放，规避悬垂。
+    void retire_shard(std::uint64_t thread_id) noexcept override {
+        std::lock_guard<std::mutex> lk(slots_mtx_);
+        auto it = slots_.find(thread_id);
+        if (it != slots_.end()) {
+            it->second->retired.store(true, std::memory_order_relaxed);
+            has_retired_.store(true, std::memory_order_relaxed);
+        }
     }
 
     // ── AsyncSinkBase 接口（前台写入）──
@@ -320,8 +340,13 @@ private:
 
         std::lock_guard<std::mutex> lk(slots_mtx_);
         auto it = slots_.find(thread_id);
-        if (it == slots_.end())
+        if (it != slots_.end()) {
+            // 该 tid 的分片可能已被标记退役（旧线程退出、尚未回收）；同 tid 被新
+            // 线程复用时撤销标记并继续复用（分片仍存活，SPSC 写者从旧线程换成新线程）。
+            it->second->retired.store(false, std::memory_order_relaxed);
+        } else {
             it = slots_.emplace(thread_id, std::make_unique<ThreadSlot>()).first;
+        }
         tls.owner    = this;
         tls.owner_id = instance_id_;
         tls.slot     = it->second.get();
@@ -341,7 +366,7 @@ private:
     // 缓冲（worker 非热路径，一次拷贝可忽略），保证解码端数据连续。
     bool drain_one() override {
         ThreadSlot* slot = pick_slot();
-        if (!slot) return false;
+        if (!slot) { reap_retired(); return false; }   // 空闲时也回收退役分片
 
         bool any = false;
         thread_local static std::vector<std::byte> tl_rec;
@@ -374,7 +399,34 @@ private:
             std::lock_guard<std::mutex> lk(slot->cv_mtx);
             if (slot->waiting) slot->cv.notify_one();
         }
+
+        reap_retired();   // 此处 slot 已不再被使用，回收（含 slot 自身）安全
         return any;
+    }
+
+    // 回收"写者已退出且已排空"的分片，释放其 ring（默认 1MB）。仅 worker 线程调用。
+    // 与 current_slot / retire_shard 通过 slots_mtx_ 互斥；has_retired_ 做无锁节流，
+    // 无退役分片时零遍历。删除前提是该分片 readable()==0（写者退出前已 flush，
+    // worker 已排空）——此时不会有写者再写它（同 tid 复用时 current_slot 会清除
+    // retired 标记复用，二者在锁内互斥）。
+    void reap_retired() {
+        if (!has_retired_.load(std::memory_order_relaxed)) return;
+        std::lock_guard<std::mutex> lk(slots_mtx_);
+        has_retired_.store(false, std::memory_order_relaxed);
+        bool still = false;
+        for (auto it = slots_.begin(); it != slots_.end(); ) {
+            ThreadSlot* s = it->second.get();
+            if (s->retired.load(std::memory_order_relaxed)) {
+                if (s->ring.readable() == 0 &&
+                    !s->pending.load(std::memory_order_relaxed)) {
+                    it = slots_.erase(it);   // unique_ptr 析构 → 释放分片内存
+                    continue;
+                }
+                still = true;   // 尚有残留数据，等其排空后再回收
+            }
+            ++it;
+        }
+        if (still) has_retired_.store(true, std::memory_order_relaxed);  // 下轮继续
     }
 
     // 在锁内选一个有 pending 的分片（轮转），返回裸指针（本对象存活期内有效）
@@ -443,6 +495,10 @@ private:
     std::atomic<std::uint64_t> dropped_oversize_{0};
     std::atomic<std::uint64_t> dropped_destructor_{0};
     std::atomic<std::uint64_t> blocked_waits_{0};
+
+    // 是否有待回收分片（retire_shard 置位，reap_retired 清除）。用于让 worker
+    // 的回收扫描在无退役分片时不遍历 slots_（稳态零开销）。
+    std::atomic<bool> has_retired_{false};
 
     mutable std::mutex slots_mtx_;
     std::unordered_map<std::uint64_t, std::unique_ptr<ThreadSlot>> slots_;
