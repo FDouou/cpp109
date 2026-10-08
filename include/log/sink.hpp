@@ -4,7 +4,10 @@
 #include "formatter.hpp"
 #include "log_level.hpp"
 
+#include <atomic>
 #include <cstddef>
+#include <cstdint>
+#include <cstdio>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -64,6 +67,13 @@ public:
     }
     LogLevel level() const noexcept { return level_; }
 
+    // I/O 失败计数（write/flush 失败累计）。用于区分"业务没打日志"与
+    // "库写失败"，并支撑容量/健康度观测。子类在 fwrite/fflush 失败时调用
+    // report_io_error() 递增。
+    std::uint64_t io_error_count() const noexcept {
+        return io_errors_.load(std::memory_order_relaxed);
+    }
+
     virtual void set_pattern(const std::string& pattern){
         std::lock_guard<std::mutex> lock(mutex_);
         formatter_->set_pattern(pattern);
@@ -92,9 +102,27 @@ protected:
         // 默认实现：空操作
     }
 
+    // 记录一次 I/O 失败：计数 + 首次输出一次性 stderr 告警（避免刷屏）。
+    // 不抛异常——运行期多由后台 worker 调用，异常既无处处理又会留下不一致状态
+    // （例如文件已关闭但指针未清）。子类失败时应清理自身状态为"可安全重试/跳过"，
+    // 再调用本函数。
+    void report_io_error() noexcept {
+        io_errors_.fetch_add(1, std::memory_order_relaxed);
+        bool expected = false;
+        if (io_error_warned_.compare_exchange_strong(expected, true,
+                                                     std::memory_order_relaxed)) {
+            std::fprintf(stderr,
+                         "[cpp109] sink I/O error (write/flush failed); logging "
+                         "continues but output may be lost. Total counted in "
+                         "io_error_count().\n");
+        }
+    }
+
     std::mutex              mutex_;
     std::unique_ptr<Formatter> formatter_;
     LogLevel                level_ = LogLevel::TRACE;
+    std::atomic<std::uint64_t> io_errors_{0};
+    std::atomic<bool>          io_error_warned_{false};
 };
 
 // ── AsyncSink 的非模板基类（用于 Logger 做 dynamic_cast 检测）──

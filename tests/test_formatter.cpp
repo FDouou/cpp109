@@ -5,9 +5,7 @@
 #include <cassert>
 #include <string>
 
-#define CPP109_TEST(name) void test_##name()
-#define CPP109_ASSERT(cond) do { if (!(cond)) { fprintf(stderr, "FAIL: %s:%d: %s\n", __FILE__, __LINE__, #cond); } } while(0)
-#define CPP109_ASSERT_EQ(a, b) do { if ((a) != (b)) { fprintf(stderr, "FAIL: %s:%d: %s == %s\n", __FILE__, __LINE__, #a, #b); } } while(0)
+#include "test_common.h"
 
 namespace {
 
@@ -115,6 +113,10 @@ int main() {
     test_escape_percent();
     test_colored_formatter();
 
-    fprintf(stdout, "test_formatter.cpp: all tests passed\n");
-    return 0;
+    if (cpp109_test::failures() == 0) {
+        fprintf(stdout, "test_formatter.cpp: all tests passed\n");
+    } else {
+        fprintf(stderr, "test_formatter.cpp: %d failure(s)\n", cpp109_test::failures());
+    }
+    return CPP109_TEST_RESULT();
 }

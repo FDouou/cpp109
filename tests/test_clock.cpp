@@ -7,8 +7,7 @@
 #include <cstdint>
 #include <thread>
 
-#define CPP109_TEST(name) void test_##name()
-#define CPP109_ASSERT(cond) do { if (!(cond)) { fprintf(stderr, "FAIL: %s:%d: %s\n", __FILE__, __LINE__, #cond); } } while(0)
+#include "test_common.h"
 
 namespace {
 
@@ -89,6 +88,10 @@ int main() {
     test_ns_to_tsc_roundtrip();
     test_timer_ids_even_after_long_run();
 
-    fprintf(stdout, "test_clock.cpp: all tests passed\n");
-    return 0;
+    if (cpp109_test::failures() == 0) {
+        fprintf(stdout, "test_clock.cpp: all tests passed\n");
+    } else {
+        fprintf(stderr, "test_clock.cpp: %d failure(s)\n", cpp109_test::failures());
+    }
+    return CPP109_TEST_RESULT();
 }

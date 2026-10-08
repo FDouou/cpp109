@@ -8,9 +8,7 @@
 #include <fstream>
 #include <string>
 
-#define CPP109_TEST(name) void test_##name()
-#define CPP109_ASSERT(cond) do { if (!(cond)) { fprintf(stderr, "FAIL: %s:%d: %s\n", __FILE__, __LINE__, #cond); } } while(0)
-#define CPP109_ASSERT_EQ(a, b) do { if ((a) != (b)) { fprintf(stderr, "FAIL: %s:%d: %s == %s\n", __FILE__, __LINE__, #a, #b); } } while(0)
+#include "test_common.h"
 
 namespace {
 
@@ -204,6 +202,102 @@ CPP109_TEST(async_large_string_fallback)
     std::remove(filename);
 }
 
+// 回归：同一线程交替使用两个各绑独立 AsyncSink 的 logger，不得串扰。
+// 这是"约束②"（一线程一批周期内只用一个 async logger）被违反时的兜底：
+// 换 sink 前必须先用旧 sink 提交旧数据，否则先写者的记录会落进后写者的文件。
+CPP109_TEST(async_multi_logger_no_crosstalk)
+{
+    const char* fa = "test_crosstalk_a.log";
+    const char* fb = "test_crosstalk_b.log";
+    std::remove(fa); std::remove(fb);
+
+    {
+        // logger 名不含 '.' → 无 parent → 走异步快路径（batch）
+        auto la = std::make_shared<cpp109::Logger>("net");
+        auto lb = std::make_shared<cpp109::Logger>("db");
+        auto sa = std::make_shared<cpp109::AsyncSink<>>(
+            std::make_shared<cpp109::FileSink>(fa, true));
+        auto sb = std::make_shared<cpp109::AsyncSink<>>(
+            std::make_shared<cpp109::FileSink>(fb, true));
+        la->add_sink(sa);
+        lb->add_sink(sb);
+        la->set_level(cpp109::LogLevel::TRACE);
+        lb->set_level(cpp109::LogLevel::TRACE);
+
+        // 交替写，确保落在同一个 batch 周期内（总量远小于 16KB 批容量）
+        for (int i = 0; i < 20; ++i) {
+            LOG_INFO_TO(la, "AAA-{}", i);
+            LOG_INFO_TO(lb, "BBB-{}", i);
+        }
+        la->flush();
+        lb->flush();
+    }
+
+    auto read_all = [](const char* p) {
+        std::ifstream f(p);
+        return std::string((std::istreambuf_iterator<char>(f)),
+                            std::istreambuf_iterator<char>());
+    };
+    const std::string ca = read_all(fa);
+    const std::string cb = read_all(fb);
+
+    CPP109_ASSERT(ca.find("AAA-") != std::string::npos);
+    CPP109_ASSERT(ca.find("BBB-") == std::string::npos);   // A 文件不得含 B
+    CPP109_ASSERT(cb.find("BBB-") != std::string::npos);
+    CPP109_ASSERT(cb.find("AAA-") == std::string::npos);   // B 文件不得含 A
+
+    std::remove(fa); std::remove(fb);
+}
+
+// 回归：单条记录超过 ring 容量 → dropped_oversize 计数递增，且不崩溃、不静默。
+CPP109_TEST(async_drop_stats)
+{
+    const char* fn = "test_drop_stats.log";
+    std::remove(fn);
+    {
+        auto logger = std::make_shared<cpp109::Logger>("dropstats");
+        auto async = std::make_shared<cpp109::AsyncSink<1024>>(   // 1KB ring
+            std::make_shared<cpp109::FileSink>(fn, true));
+        logger->add_sink(async);
+        logger->set_level(cpp109::LogLevel::TRACE);
+
+        std::string big(2048, 'X');                 // 单条 > ring 容量
+        LOG_INFO_TO(logger, "big={}", big);         // 触发 dropped_oversize
+        LOG_INFO_TO(logger, "small-ok");            // 正常一条
+        logger->flush();
+
+        const auto st = async->stats();
+        CPP109_ASSERT(st.dropped_oversize >= 1);
+        CPP109_ASSERT(st.dropped_ring_full == 0);
+    }
+    std::remove(fn);
+}
+
+// 回归：异步快路径也要输出 logger 名（%n）。此前 worker 解码时 logger_name
+// 传空串，%n 恒为空；现由调用点 TinyMeta 惰性携带。
+CPP109_TEST(async_logger_name)
+{
+    const char* fn = "test_async_name.log";
+    std::remove(fn);
+    {
+        auto logger = std::make_shared<cpp109::Logger>("myname");   // 名不含 '.' → 快路径
+        auto async = std::make_shared<cpp109::AsyncSink<>>(
+            std::make_shared<cpp109::FileSink>(fn, true));
+        logger->add_sink(async);
+        logger->set_level(cpp109::LogLevel::TRACE);
+        async->set_pattern("[%n] %v");   // 转发到内部 FileSink 的 formatter
+
+        LOG_INFO_TO(logger, "hello-name");
+        logger->flush();
+    }
+    std::ifstream ifs(fn);
+    const std::string content((std::istreambuf_iterator<char>(ifs)),
+                              std::istreambuf_iterator<char>());
+    CPP109_ASSERT(content.find("[myname]") != std::string::npos);
+    CPP109_ASSERT(content.find("hello-name") != std::string::npos);
+    std::remove(fn);
+}
+
 } // anonymous namespace
 
 int main() {
@@ -211,7 +305,14 @@ int main() {
     test_async_multithread();
     test_async_codec_string_family();
     test_async_large_string_fallback();
+    test_async_multi_logger_no_crosstalk();
+    test_async_drop_stats();
+    test_async_logger_name();
 
-    fprintf(stdout, "test_async.cpp: all tests passed\n");
-    return 0;
+    if (cpp109_test::failures() == 0) {
+        fprintf(stdout, "test_async.cpp: all tests passed\n");
+    } else {
+        fprintf(stderr, "test_async.cpp: %d failure(s)\n", cpp109_test::failures());
+    }
+    return CPP109_TEST_RESULT();
 }

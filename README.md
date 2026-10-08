@@ -214,6 +214,17 @@ cmake --build build
 ctest --test-dir build
 ```
 
+## 快路径
+
+同时满足即为**异步快路径**：
+
+1. logger 只挂**一个** sink，且该是 `AsyncSink`
+2. 无父 logger
+
+不满足则退化
+
+批收益前提：同一线程不要交替调用不同的 async logger（换 sink 会强制提交、逼近 direct 开销；输出仍正确，仅损失批收益）。落盘延迟敏感改用 `CPP109_USE_BATCH=0`或关键点 `logger->flush()`；默认 batch 落盘延迟无上限。
+
 ## 性能
 
 > （i9-12900HX / MSVC /O2 / Release，2.5GHz，宏写入路径）

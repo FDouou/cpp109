@@ -21,7 +21,9 @@ namespace cpp109 {
 // Batch buffer for foreground thread: accumulate multiple records and submit
 // as one batch to reduce atomic RMW on the ring buffer.
 namespace detail {
-    // 前台线程批量缓冲容量；可用 CPP109_BATCH_CAPACITY 覆盖（基准实验用）
+    // 前台线程批量缓冲容量；可用 CPP109_BATCH_CAPACITY 覆盖（基准实验用）。
+    // 16KB ≈ 100~160 条典型日志行（~100-200B），在"减少原子操作/唤醒次数"
+    // 与"线程局部内存占用 / 突发可见延迟"之间取平衡；早期为 4KB。
 #ifndef CPP109_BATCH_CAPACITY
 #define CPP109_BATCH_CAPACITY 16384
 #endif
@@ -34,14 +36,23 @@ namespace detail {
 #define CPP109_USE_BATCH 1
 #endif
 
-    // 批量缓冲的定时提交阈值（TSC 周期，约 60~100ms 视 TSC 频率）。
-    // 稀疏日志不会填满批缓冲，靠该阈值保证最迟提交间隔；阈值偏小时
-    // （如 2ms）低速率多线程下每批条数不足 100，flush 样本占比会超过
-    // 1% 并推高 P99（实测 x32@0.5M 由 278ns 恶化到 3.1us）。默认取
-    // 100ms 量级：间歇式日志可攒数条再提交（实测 P50 再降约 40%），
-    // 代价是极稀疏日志落盘延迟上限相应变大。
-    // 定时提交不唤醒 worker（由 worker 轮询兜底），避免稀疏日志每条
-    // 触发 futex 唤醒。
+    // 批量缓冲的【惰性】定时提交阈值（TSC 周期，约 100ms 视 TSC 频率）。
+    //
+    // 重要：这个阈值不是"落盘延迟上界"，而是"下次写入时的最小提交间隔"。
+    // 阈值判定写在 log_dispatch 内部，只有该线程【下一次写日志】时才执行；
+    // 库内没有独立定时器，worker 也不碰 TLS。因此线程停写（长计算/阻塞
+    // IO/idle/**假死**）时，批次里的日志会无限期滞留到"下次写入或线程
+    // 退出"——落盘延迟没有上限。这是批量提交的固有属性：持久化承诺从
+    // "进入 ring"起算，TLS batch 内不在承诺范围。
+    //
+    // 需要低延迟请改用 CPP109_USE_BATCH=0（direct，延迟 ≤ worker 轮询周期）
+    // 或在检查点手动 logger->flush()。不为该滞留引入跨线程抢救（watchdog），
+    // 理由见 QA.md 1.11。
+    //
+    // 阈值偏小时（如 2ms）低速率多线程下每批条数不足 100，flush 样本占比
+    // 会超过 1% 并推高 P99（实测 x32@0.5M 由 278ns 恶化到 3.1us）。默认取
+    // 100ms 量级。定时提交不唤醒 worker（由 worker 50μs 轮询兜底），避免
+    // 稀疏日志每条触发 futex 唤醒。
 #ifndef CPP109_BATCH_FLUSH_INTERVAL_TSC
 #define CPP109_BATCH_FLUSH_INTERVAL_TSC 250000000ULL
 #endif
@@ -61,6 +72,16 @@ namespace detail {
 
     // 前台线程的批量提交缓冲区。线程退出（thread_local 析构）时自动提交
     // 未满批次，避免程序退出时最后一批日志残留在 thread_local 中丢失。
+    //
+    // ── 设计前提（务必看清）──
+    // tl_batch 是【线程私有、跨所有 logger 共享】的，而 sink 字段是【单指针】。
+    // 这依赖两个前提，快路径只强制了第一个：
+    //   约束① 一个 logger 只挂一个 async sink —— 由 Logger::update_fast_path
+    //         强制（多 sink 直接退化慢路径，正确但慢）；
+    //   约束② 一个线程在一个批周期内只用一个 async logger —— 无任何机制。
+    // 违反约束②（同一线程交替写两个各绑独立 AsyncSink 的 logger）时，先写者
+    // 的记录会在提交时被整批交给后写者的 sink → 落进错误的文件。修法见
+    // log_dispatch：换 sink 时先用旧 sink 提交旧数据（优雅降级）。
     struct BatchBuffer {
         std::byte      data[BATCH_CAPACITY];
         std::size_t    size = 0;
@@ -87,6 +108,23 @@ namespace detail {
             }
             last_flush_tsc = rdtsc_ns();
         }
+
+        // 首次检测到"一个线程在一个批周期内使用多个 async logger"时提示一次。
+        // 该用法已由 log_dispatch 优雅降级（切换时先用旧 sink 提交旧数据），
+        // 功能正确，只是批提交收益下降。用一次性告警而非 assert abort——
+        // 偶发交替是合理用法，不应打断。
+        void warn_sink_switch_once() {
+            if (!warned_sink_switch) {
+                warned_sink_switch = true;
+                std::fprintf(stderr,
+                    "[cpp109] a thread wrote to multiple async loggers within one "
+                    "batch cycle; the pending batch was flushed on sink switch "
+                    "(output correct, throughput lower). Prefer one async logger "
+                    "per thread, or share a single AsyncSink.\n");
+            }
+        }
+
+        bool warned_sink_switch = false;
     };
 
     inline thread_local BatchBuffer tl_batch{};
@@ -97,7 +135,11 @@ namespace detail {
 
     // 提交所有存活线程的未满批次。
     // 约束：须在全部日志写入线程已停止写入后调用（如进程退出前、线程池 drained 后），
-    // 否则会与正在写入的线程产生数据竞争。
+    // 否则会与正在写入的线程产生数据竞争（size 非原子，且批内记录可能半写）。
+    // 注意：调用者线程替其他线程提交时，会经由 AsyncSink::current_slot 的 TLS
+    // 缓存——缓存 key 是 (sink 实例)，不含 thread_id，故同一次 flush_all 中多个
+    // 线程的记录会被路由到同一分片。遵守上述约束时数据不丢（header 内 thread_id
+    // 正确），但分片归属与落盘顺序会变化。
     inline void flush_all_batches() {
         std::lock_guard<std::mutex> lk(batch_registry_mutex());
         for (auto* b : active_batches()) b->flush();
@@ -275,6 +317,19 @@ void Logger::log_dispatch(LogLevel level, TinyMeta* cs, Args&&... args)
 {
     if (level < level_.load(std::memory_order_acquire)) return;
 
+    // %n 需要 logger 名：调用点首次经过时惰性写入到 TinyMeta（per-callsite
+    // 静态存储、进程级存活，异步 worker 解码时读取）。稳态只做一次 relaxed
+    // load 判定，近零开销。前提：同一调用点固定同一 logger。
+    if (!cs->logger_name_set.load(std::memory_order_relaxed)) {
+        bool expected = false;
+        if (cs->logger_name_set.compare_exchange_strong(
+                expected, true, std::memory_order_release,
+                std::memory_order_relaxed)) {
+            std::snprintf(cs->logger_name, TinyMeta::kLoggerNameCap,
+                          "%s", name_.c_str());
+        }
+    }
+
     // decode_fn 只依赖参数类型组合，每个调用点恒定：首次调用惰性写入。
     // 同一调用点的所有线程写入相同的值，atomic 消除数据竞争；
     // worker 经 ring 的 release/acquire 同步后读取。
@@ -303,6 +358,15 @@ void Logger::log_dispatch(LogLevel level, TinyMeta* cs, Args&&... args)
         const std::uint64_t now_tsc = rdtsc_ns();
         std::byte* batch_data = detail::tl_batch.data;
         std::size_t& batch_sz = detail::tl_batch.size;
+
+        // 约束②（见 BatchBuffer）：tl_batch 跨所有 logger 共享、sink 为单指针。
+        // 若本线程在一个批周期内切到另一个 async sink，必须先用【旧 sink】提交
+        // 缓冲里的旧数据，否则旧记录会被后面整批交给新 sink，落进错误的文件。
+        // 正常用法（一线程一 async logger）下 sink 恒等于 abase，仅一次指针比较。
+        if (batch_sz > 0 && detail::tl_batch.sink != abase) {
+            detail::tl_batch.flush();
+            detail::tl_batch.warn_sink_switch_once();
+        }
         detail::tl_batch.sink = abase;
 
         const std::size_t needed = sizeof(TinyHeader) + args_size;

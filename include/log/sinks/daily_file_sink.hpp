@@ -30,8 +30,11 @@ public:
           max_files_(max_files),
           last_rotate_time_(Timestamp::now())
     {
-        // 打开第一个文件
-        do_rotate();
+        // 打开第一个文件；构造期失败直接抛，让用户立即知道（而非静默丢弃）
+        if (!do_rotate()) {
+            throw std::runtime_error("DailyFileSink: failed to open initial log file: "
+                                     + filename_pattern_);
+        }
     }
 
     ~DailyFileSink() override {
@@ -40,15 +43,19 @@ public:
 
 protected:
     void write(const std::string& formatted_msg, const LogEvent& event) override {
+        if (file_ == nullptr) { report_io_error(); return; }
         if (should_rotate()) {
             do_rotate();
+            if (file_ == nullptr) { report_io_error(); return; }
         }
-        fwrite(formatted_msg.data(), 1, formatted_msg.size(), file_);
-        fputc('\n', file_);
+        const bool ok =
+            fwrite(formatted_msg.data(), 1, formatted_msg.size(), file_) == formatted_msg.size()
+            && fputc('\n', file_) != EOF;
+        if (!ok) report_io_error();
     }
 
     void flush_impl() override {
-        fflush(file_);
+        if (file_ != nullptr && fflush(file_) != 0) report_io_error();
     }
 
 private:
@@ -72,23 +79,26 @@ private:
         return false;
     }
 
-    void do_rotate() {
-        if (file_) fclose(file_);
+    // 滚动到新文件。不抛异常，失败返回 false（file_ 为 nullptr 或保持已关闭
+    // 前置空），绝不悬垂指针。返回是否成功打开新文件。
+    bool do_rotate() {
+        if (file_) { fclose(file_); file_ = nullptr; }
 
         std::string filename = current_filename();
+        if (filename.empty()) return false;   // current_filename 已 report
+
         file_ = fopen(filename.c_str(), "a");
-        if (file_ == nullptr) {
-            throw std::runtime_error("Failed to open file: " + filename);
-        }
+        if (file_ == nullptr) return false;
 
         last_rotate_time_ = Timestamp::now();
 
         if (max_files_ > 0) {
             cleanup_old_files();
         }
+        return true;
     }
 
-    std::string current_filename() const {
+    std::string current_filename() {
         auto now = Timestamp::now();
         auto t = std::chrono::system_clock::to_time_t(now.get());
         std::tm tm;
@@ -101,7 +111,8 @@ private:
         char buffer[1024];
         std::size_t len = std::strftime(buffer, sizeof(buffer), filename_pattern_.c_str(), &tm);
         if(len == 0){
-            throw std::runtime_error("Log filename pattern is too long or invalid");
+            report_io_error();
+            return {};
         }
         return std::string(buffer, len);
     }

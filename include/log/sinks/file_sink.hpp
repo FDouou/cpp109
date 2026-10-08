@@ -37,8 +37,11 @@ public:
 
 protected:
     void write(const std::string& formatted_msg, const LogEvent& event) override{
-        fwrite(formatted_msg.data(), 1, formatted_msg.size(), file_);
-        fputc('\n', file_);
+        if (file_ == nullptr) { report_io_error(); return; }
+        const bool ok =
+            fwrite(formatted_msg.data(), 1, formatted_msg.size(), file_) == formatted_msg.size()
+            && fputc('\n', file_) != EOF;
+        if (!ok) report_io_error();
         if(flush_interval_ms_ == 0) {
             flush_impl();
         }else if(flush_interval_ms_ > 0) {
@@ -51,7 +54,7 @@ protected:
         }
     }
     void flush_impl() override{
-        fflush(file_);
+        if (file_ != nullptr && fflush(file_) != 0) report_io_error();
     }
 
 private:

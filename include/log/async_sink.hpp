@@ -65,6 +65,24 @@ class AsyncSink final : public AsyncSinkBase {
     };
 
 public:
+    // 投递层统计：用于区分"业务没打日志"与"库丢弃/背压"，并支撑容量规划。
+    // 注意这与底层 Sink 的 io_error_count() 分属两层——本结构统计入队侧
+    // （ring 满/超容量/析构残留/阻塞等待），Sink 侧统计落盘失败。
+    struct Stats {
+        std::uint64_t dropped_ring_full  = 0;  // DROP_NEWEST：ring 满，被丢弃的记录数
+        std::uint64_t dropped_oversize   = 0;  // 单条记录 > ring 容量，无法入队的次数
+        std::uint64_t dropped_destructor = 0;  // 析构时随分片整表释放而丢弃的字节数
+        std::uint64_t blocked_waits      = 0;  // BLOCK：生产者等待 worker 腾空间的次数
+    };
+    Stats stats() const noexcept {
+        return Stats{
+            dropped_ring_full_.load(std::memory_order_relaxed),
+            dropped_oversize_.load(std::memory_order_relaxed),
+            dropped_destructor_.load(std::memory_order_relaxed),
+            blocked_waits_.load(std::memory_order_relaxed),
+        };
+    }
+
     explicit AsyncSink(std::shared_ptr<Sink> wrapped)
         : wrapped_(std::move(wrapped))
     {
@@ -87,6 +105,11 @@ public:
 
     ~AsyncSink() override {
         LogBackend::instance().unregister_sink(shard_index_, this);
+        // 析构不 drain：统计随分片整表释放而丢弃的字节数。unregister 之后
+        // worker 不再访问本对象，此处读 ring 是安全的（单线程析构路径）。
+        std::uint64_t residual = 0;
+        for (auto& kv : slots_) residual += kv.second->ring.readable();
+        if (residual) dropped_destructor_.fetch_add(residual, std::memory_order_relaxed);
     }
 
     // ── AsyncSinkBase 接口（前台写入）──
@@ -212,12 +235,18 @@ private:
     // 空间准备：BLOCK 策略等待 worker 腾空间；DROP_NEWEST 直接失败。
     // 记录/整批大于队列容量时无法入队（返回空 Chunk，调用者丢弃）。
     Chunk prepare_slot(ThreadSlot* slot, std::size_t total) {
-        if (total > slot->ring.capacity()) return {};
+        if (total > slot->ring.capacity()) {
+            dropped_oversize_.fetch_add(1, std::memory_order_relaxed);
+            return {};
+        }
         if constexpr (Policy == OverflowPolicy::DROP_NEWEST) {
-            return slot->ring.prepare_write(total);
+            auto c = slot->ring.prepare_write(total);
+            if (!c.ptr) dropped_ring_full_.fetch_add(1, std::memory_order_relaxed);
+            return c;
         } else {
             auto c = slot->ring.prepare_write(total);
             while (!c.ptr) {
+                blocked_waits_.fetch_add(1, std::memory_order_relaxed);
                 std::unique_lock<std::mutex> lk(slot->cv_mtx);
                 slot->waiting = true;
                 slot->cv.wait_for(lk, std::chrono::microseconds(100), [&] {
@@ -381,8 +410,13 @@ private:
         }
 
         std::uint64_t timestamp_ns = RdtscClock::instance().to_ns(hdr->timestamp_tsc);
+        // logger 名由调用点 TinyMeta 惰性携带（见 Logger::log_dispatch）；
+        // acquire 配对发布，未写入时回退空串。
+        const char* lname =
+            (meta && meta->logger_name_set.load(std::memory_order_acquire))
+                ? meta->logger_name : "";
         LogEvent event(
-            "" /* logger_name */,
+            lname,
             static_cast<LogLevel>(hdr->level),
             timestamp_ns,
             meta ? (meta->file ? meta->file : "") : "",
@@ -403,6 +437,12 @@ private:
     std::size_t shard_index_ = 0;             // 构造尾部由 register_sink 赋值
     std::uint64_t instance_id_ = 0;           // TLS 缓存校验用（全局唯一）
     std::uint64_t notify_interval_tsc_ = 0;   // 唤醒限流阈值（TSC 周期）
+
+    // 投递层统计（stats() 读取）。仅在被丢弃/阻塞的异常路径递增，正常路径零开销。
+    std::atomic<std::uint64_t> dropped_ring_full_{0};
+    std::atomic<std::uint64_t> dropped_oversize_{0};
+    std::atomic<std::uint64_t> dropped_destructor_{0};
+    std::atomic<std::uint64_t> blocked_waits_{0};
 
     mutable std::mutex slots_mtx_;
     std::unordered_map<std::uint64_t, std::unique_ptr<ThreadSlot>> slots_;

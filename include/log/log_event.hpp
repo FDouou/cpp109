@@ -47,6 +47,15 @@ struct TinyMeta {
     // 类型，故首次调用时由 log_at 惰性写入（atomic 保证多线程安全）。
     mutable std::atomic<DecodeFn> decode_fn;             // 8B
 
+    // 调用点所属 logger 名（首次调用惰性写入，见 Logger::log_dispatch）。
+    // per-callsite 静态存储、进程级存活，供异步路径 worker 解码时填 LogEvent
+    // 的 %n（同步路径直接用 Logger::name_，不读这里）。
+    // 前提：同一调用点固定同一 logger——与"同一调用点固定同一 fmt/decode_fn"
+    // 是同一前提；跨 logger 复用同一调用点（如循环里传不同 logger）时只记首个。
+    static constexpr std::size_t kLoggerNameCap = 32;
+    mutable char              logger_name[kLoggerNameCap] = {};
+    mutable std::atomic<bool> logger_name_set{false};
+
     constexpr TinyMeta(const char* f, int l, const char* fn, const char* fm,
                        DecodeFn df = nullptr) noexcept
         : file(f), line(l), func(fn), fmt(fm), decode_fn(df) {}

@@ -3,14 +3,13 @@
 #include "log/log.hpp"
 #include <cstdio>
 #include <cassert>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <string>
 #include <vector>
 
-#define CPP109_TEST(name) void test_##name()
-#define CPP109_ASSERT(cond) do { if (!(cond)) { fprintf(stderr, "FAIL: %s:%d: %s\n", __FILE__, __LINE__, #cond); } } while(0)
-#define CPP109_ASSERT_EQ(a, b) do { if ((a) != (b)) { fprintf(stderr, "FAIL: %s:%d: %s == %s\n", __FILE__, __LINE__, #a, #b); } } while(0)
+#include "test_common.h"
 
 namespace {
 
@@ -92,6 +91,44 @@ CPP109_TEST(rotating_file_sink)
     std::remove(filename);
 }
 
+// 回归：rotate 失败不得崩溃、不得把已关闭的 FILE* 留在 file_ 里被后续 fwrite
+// 使用；失败应计入 io_error_count（而非静默）。这里用"目录占住滚动目标名"
+// 稳定制造 rename 失败。
+CPP109_TEST(rotating_failure_resilient)
+{
+    namespace fs = std::filesystem;
+    const char* base = "test_rot_fail.log";
+    const char* idx1 = "test_rot_fail.log.1";
+    std::error_code ec;
+    std::remove(base);
+    fs::remove_all(idx1, ec);
+    fs::create_directory(idx1, ec);   // 使 rename(base → base.1) 失败
+
+    {
+        // max_size_mb=0 → 每条日志都触发 rotate；max_files=1 → 只滚动一层
+        auto sink = std::make_shared<cpp109::RotatingFileSink>(base, 0, 1);
+        sink->set_level(cpp109::LogLevel::DEBUG);
+
+        for (int i = 0; i < 5; ++i) {
+            cpp109::LogEvent event(
+                "test_rot_fail",
+                cpp109::LogLevel::INFO,
+                std::string("msg ") + std::to_string(i),
+                cpp109::Timestamp(),
+                cpp109::SourceLoc{__FILE__, __LINE__, __func__},
+                0
+            );
+            sink->log(event);   // 修复前：rotate 失败后 fwrite 到已关闭/空 file_ → 崩溃
+        }
+        sink->flush();
+
+        CPP109_ASSERT(sink->io_error_count() >= 1);
+    }
+
+    fs::remove_all(idx1, ec);
+    std::remove(base);
+}
+
 CPP109_TEST(callback_sink)
 {
     std::vector<std::string> captured;
@@ -123,8 +160,13 @@ int main() {
     test_console_sink();
     test_file_sink();
     test_rotating_file_sink();
+    test_rotating_failure_resilient();
     test_callback_sink();
 
-    fprintf(stdout, "test_sinks.cpp: all tests passed\n");
-    return 0;
+    if (cpp109_test::failures() == 0) {
+        fprintf(stdout, "test_sinks.cpp: all tests passed\n");
+    } else {
+        fprintf(stderr, "test_sinks.cpp: %d failure(s)\n", cpp109_test::failures());
+    }
+    return CPP109_TEST_RESULT();
 }

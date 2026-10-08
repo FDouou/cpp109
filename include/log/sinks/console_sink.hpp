@@ -23,16 +23,18 @@ protected:
     void write(const std::string& formatted_msg, const LogEvent& event) override{
         if(colored_){
             platform::set_console_color(level_to_console_color(event.level()));
-            fputs(formatted_msg.c_str(), target_);
-            fputc('\n', target_);
+            const bool ok = fputs(formatted_msg.c_str(), target_) != EOF
+                         && fputc('\n', target_) != EOF;
             platform::reset_console_color();
+            if (!ok) report_io_error();
         }else{
-            fputs(formatted_msg.c_str(), target_);
-            fputc('\n', target_);
+            const bool ok = fputs(formatted_msg.c_str(), target_) != EOF
+                         && fputc('\n', target_) != EOF;
+            if (!ok) report_io_error();
         }
     }
     void flush_impl() override{
-        fflush(target_);
+        if (fflush(target_) != 0) report_io_error();
     }
 
 private:
